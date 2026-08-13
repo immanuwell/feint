@@ -21,3 +21,5 @@ anyhow = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }

@@ -23,6 +23,9 @@ enum Command {
         /// Where to write the generated config.
         #[arg(long, default_value = "seedy.yaml")]
         config: std::path::PathBuf,
+        /// Schema(s) to introspect. Repeat to include more than one.
+        #[arg(long = "schema", default_value = "public")]
+        schemas: Vec<String>,
     },
     /// Generate deterministic synthetic data per seedy.yaml and insert it.
     Up {
@@ -34,6 +37,9 @@ enum Command {
         /// Override the seed from seedy.yaml.
         #[arg(long)]
         seed: Option<String>,
+        /// Schema(s) to introspect. Repeat to include more than one.
+        #[arg(long = "schema", default_value = "public")]
+        schemas: Vec<String>,
     },
 }
 
@@ -44,11 +50,13 @@ async fn main() -> anyhow::Result<()> {
         Command::Init {
             database_url,
             config,
-        } => commands::init::run(&database_url, &config).await,
+            schemas,
+        } => commands::init::run(&database_url, &config, &schemas).await,
         Command::Up {
             database_url,
             config,
             seed,
-        } => commands::up::run(&database_url, &config, seed).await,
+            schemas,
+        } => commands::up::run(&database_url, &config, seed, &schemas).await,
     }
 }

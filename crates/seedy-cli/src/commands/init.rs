@@ -6,7 +6,7 @@ use seedy_core::introspect::{self, TypeKind};
 
 use crate::ui;
 
-pub async fn run(database_url: &str, config_path: &Path) -> anyhow::Result<()> {
+pub async fn run(database_url: &str, config_path: &Path, schemas: &[String]) -> anyhow::Result<()> {
     let spinner = ui::spinner("Analyzing database...");
     let (client, connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls).await?;
     tokio::spawn(async move {
@@ -15,7 +15,7 @@ pub async fn run(database_url: &str, config_path: &Path) -> anyhow::Result<()> {
         }
     });
 
-    let schema = introspect::introspect(&client).await?;
+    let schema = introspect::introspect(&client, schemas).await?;
     spinner.finish_and_clear();
 
     let fk_count: usize = schema.tables.iter().map(|t| t.foreign_keys.len()).sum();
@@ -56,12 +56,13 @@ pub async fn run(database_url: &str, config_path: &Path) -> anyhow::Result<()> {
 
     if check_count > 0 {
         ui::warn(format!(
-            "{check_count} CHECK constraints detected (not validated by generators — review seedy.yaml)"
+            "{check_count} CHECK constraints detected (not validated by generators — see comments in {})",
+            config_path.display()
         ));
     }
 
     let config = SeedyConfig::from_schema(&schema);
-    config.save(config_path)?;
+    config.save_annotated(&schema, config_path)?;
     println!();
     ui::check(format!("Generated {}", config_path.display()));
 

@@ -34,7 +34,7 @@ impl SeedyConfig {
     /// Build a default config from an introspected schema: every table
     /// gets `DEFAULT_ROWS` rows and no explicit column overrides — column
     /// generators are inferred at generation time by
-    /// [`crate::generate::resolve_generator`], so the file the user sees
+    /// [`crate::generate::generate_value`], so the file the user sees
     /// stays short and readable rather than listing every column.
     pub fn from_schema(schema: &Schema) -> Self {
         let tables = schema
@@ -70,5 +70,45 @@ impl SeedyConfig {
 
     pub fn table_config(&self, qualified_name: &str) -> Option<&TableConfig> {
         self.tables.get(qualified_name)
+    }
+
+    /// Render as YAML with each table's CHECK-constraint definitions
+    /// inlined as comments above it. `serde` can't attach comments, so
+    /// this builds the text by hand; kept separate from `save`/`load`
+    /// (plain `serde_yaml_ng` round-trips used by `up`) since this is
+    /// purely for the human-facing file `init` writes — the comments are
+    /// non-semantic and dropped on the next `load`.
+    pub fn to_annotated_yaml(&self, schema: &Schema) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("version: {}\n", self.version));
+        out.push_str(&format!("seed: {}\n", self.seed));
+        out.push_str("tables:\n");
+        for (name, table_config) in &self.tables {
+            out.push_str(&format!("  {name}:\n"));
+            if let Some(table) = schema.tables.iter().find(|t| t.id.qualified() == *name) {
+                if !table.check_constraints.is_empty() {
+                    out.push_str("    # CHECK constraints (not validated by generators):\n");
+                    for check in &table.check_constraints {
+                        out.push_str(&format!("    #   {}: {}\n", check.name, check.definition));
+                    }
+                }
+            }
+            out.push_str(&format!("    rows: {}\n", table_config.rows));
+            if !table_config.columns.is_empty() {
+                out.push_str("    columns:\n");
+                for (col_name, col_config) in &table_config.columns {
+                    out.push_str(&format!("      {col_name}:\n"));
+                    if let Some(gen) = &col_config.generator {
+                        out.push_str(&format!("        generator: {gen}\n"));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    pub fn save_annotated(&self, schema: &Schema, path: &Path) -> Result<()> {
+        std::fs::write(path, self.to_annotated_yaml(schema))?;
+        Ok(())
     }
 }

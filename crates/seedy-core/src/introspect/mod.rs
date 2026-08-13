@@ -130,8 +130,14 @@ struct RawTable {
     id: TableId,
 }
 
-pub async fn introspect(client: &Client) -> Result<Schema> {
-    let raw_tables = list_tables(client).await?;
+/// Introspect exactly the given schemas (e.g. `["public"]`). Scoping is
+/// explicit rather than "every non-system schema" so that (a) seedy never
+/// silently slurps up an unrelated extension's or another app's schema in
+/// the same database, and (b) tests can isolate themselves into their own
+/// schema and introspect only that one, even running in parallel against a
+/// shared container.
+pub async fn introspect(client: &Client, schemas: &[String]) -> Result<Schema> {
+    let raw_tables = list_tables(client, schemas).await?;
     let mut enum_cache: HashMap<u32, Vec<String>> = HashMap::new();
 
     let mut tables = Vec::with_capacity(raw_tables.len());
@@ -163,7 +169,7 @@ pub async fn introspect(client: &Client) -> Result<Schema> {
 /// its top-level parent — inserting into a child directly would bypass
 /// Postgres's partition routing, and counting children as separate tables
 /// would double up FK relationships.
-async fn list_tables(client: &Client) -> Result<Vec<RawTable>> {
+async fn list_tables(client: &Client, schemas: &[String]) -> Result<Vec<RawTable>> {
     let rows = client
         .query(
             "SELECT c.oid, n.nspname, c.relname \
@@ -171,9 +177,9 @@ async fn list_tables(client: &Client) -> Result<Vec<RawTable>> {
              JOIN pg_namespace n ON n.oid = c.relnamespace \
              WHERE c.relkind IN ('r', 'p') \
                AND NOT c.relispartition \
-               AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') \
+               AND n.nspname = ANY($1) \
              ORDER BY n.nspname, c.relname",
-            &[],
+            &[&schemas],
         )
         .await?;
 

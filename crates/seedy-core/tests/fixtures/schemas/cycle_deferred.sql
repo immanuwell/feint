@@ -1,0 +1,9 @@
+CREATE TABLE a (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    b_id uuid NOT NULL
+);
+CREATE TABLE b (
+    id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    a_id uuid NOT NULL REFERENCES a(id) DEFERRABLE INITIALLY DEFERRED
+);
+ALTER TABLE a ADD CONSTRAINT a_b_id_fkey FOREIGN KEY (b_id) REFERENCES b(id) DEFERRABLE INITIALLY DEFERRED;

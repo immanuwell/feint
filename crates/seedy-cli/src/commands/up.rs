@@ -11,6 +11,7 @@ pub async fn run(
     database_url: &str,
     config_path: &Path,
     seed_override: Option<String>,
+    schemas: &[String],
 ) -> anyhow::Result<()> {
     let mut config = SeedyConfig::load(config_path)?;
     if let Some(seed) = seed_override {
@@ -26,7 +27,7 @@ pub async fn run(
     });
 
     let spinner = ui::spinner("Inspecting schema...");
-    let schema = introspect::introspect(&client).await?;
+    let schema = introspect::introspect(&client, schemas).await?;
     spinner.finish_and_clear();
 
     let plan = graph::plan_insertion(&schema)?;
