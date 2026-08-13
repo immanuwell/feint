@@ -274,19 +274,20 @@ fn generate_row(
         .collect())
 }
 
-fn sql_cast_type(column: &Column) -> String {
+pub(crate) fn sql_cast_type(column: &Column) -> String {
     match &column.type_kind {
         crate::introspect::TypeKind::Array { elem_type } => format!("\"{elem_type}\"[]"),
         _ => format!("\"{}\"", column.type_name),
     }
 }
 
-async fn execute_batched_insert(
+pub(crate) async fn execute_batched_insert(
     txn: &Transaction<'_>,
     table: &Table,
     columns: &[&Column],
     rows: &[Vec<PgValue>],
     returning: &[String],
+    overriding_system_value: bool,
 ) -> Result<Vec<Vec<PgValue>>> {
     if rows.is_empty() || columns.is_empty() {
         return Ok(Vec::new());
@@ -295,7 +296,13 @@ async fn execute_batched_insert(
     let mut returned = Vec::with_capacity(rows.len());
 
     for chunk in rows.chunks(batch_rows) {
-        let sql = build_insert_sql(table, columns, chunk.len(), returning);
+        let sql = build_insert_sql(
+            table,
+            columns,
+            chunk.len(),
+            returning,
+            overriding_system_value,
+        );
         let params: Vec<&(dyn ToSql + Sync)> = chunk
             .iter()
             .flat_map(|row| row.iter().map(|v| v as &(dyn ToSql + Sync)))
@@ -313,11 +320,12 @@ async fn execute_batched_insert(
     Ok(returned)
 }
 
-fn build_insert_sql(
+pub(crate) fn build_insert_sql(
     table: &Table,
     columns: &[&Column],
     row_count: usize,
     returning: &[String],
+    overriding_system_value: bool,
 ) -> String {
     let col_list = columns
         .iter()
@@ -353,8 +361,14 @@ fn build_insert_sql(
         )
     };
 
+    let overriding_clause = if overriding_system_value {
+        " OVERRIDING SYSTEM VALUE"
+    } else {
+        ""
+    };
+
     format!(
-        "INSERT INTO \"{}\".\"{}\" ({col_list}) VALUES {}{returning_clause}",
+        "INSERT INTO \"{}\".\"{}\" ({col_list}){overriding_clause} VALUES {}{returning_clause}",
         table.id.schema,
         table.id.name,
         value_groups.join(", ")
@@ -411,7 +425,7 @@ async fn insert_plain_table(
     }
 
     let returning = returning_columns(table);
-    let returned = execute_batched_insert(txn, table, &columns, &rows, &returning).await?;
+    let returned = execute_batched_insert(txn, table, &columns, &rows, &returning, false).await?;
     register_returned(ref_pool, table, &returning, &returned);
     Ok(rows.len() as u64)
 }
@@ -482,7 +496,8 @@ async fn insert_backfill_group(
             }
         }
 
-        let returned = execute_batched_insert(txn, table, &columns, &rows, &returning).await?;
+        let returned =
+            execute_batched_insert(txn, table, &columns, &rows, &returning, false).await?;
         register_returned(ref_pool, table, &returning, &returned);
 
         let pk_indices: Vec<usize> = pk_cols
@@ -707,7 +722,8 @@ async fn insert_deferred_group(
         }
 
         let returning = returning_columns(table);
-        let returned = execute_batched_insert(txn, table, &columns, &rows, &returning).await?;
+        let returned =
+            execute_batched_insert(txn, table, &columns, &rows, &returning, false).await?;
         register_returned(ref_pool, table, &returning, &returned);
 
         progress(ProgressEvent::TableFinished {

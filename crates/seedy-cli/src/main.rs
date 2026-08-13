@@ -52,6 +52,22 @@ enum Command {
         #[arg(long = "schema", default_value = "public")]
         schemas: Vec<String>,
     },
+    /// Clone a database, preserving keys and masking sensitive columns.
+    Clone {
+        /// Postgres connection URL to read from. Only ever queried with SELECT.
+        source_url: String,
+        /// Postgres connection URL to write into.
+        target_url: String,
+        /// Subset root, e.g. "public.organizations WHERE id = 42". Not implemented yet.
+        #[arg(long)]
+        root: Option<String>,
+        /// Config file with masking overrides, if present.
+        #[arg(long, default_value = "seedy.yaml")]
+        config: std::path::PathBuf,
+        /// Schema(s) to introspect. Repeat to include more than one.
+        #[arg(long = "schema", default_value = "public")]
+        schemas: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -74,5 +90,12 @@ async fn main() -> anyhow::Result<()> {
             seed,
             schemas,
         } => commands::up::run(&database_url, &config, seed, &schemas).await,
+        Command::Clone {
+            source_url,
+            target_url,
+            root,
+            config,
+            schemas,
+        } => commands::clone::run(&source_url, &target_url, root, &config, &schemas).await,
     }
 }

@@ -7,13 +7,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::introspect::Schema;
+use crate::mask::MaskStrategy;
 
 pub const DEFAULT_SEED: &str = "default";
 pub const DEFAULT_ROWS: u32 = 100;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ColumnConfig {
+    #[serde(default)]
     pub generator: Option<String>,
+    /// CLONE-mode masking strategy override. See [`crate::mask`].
+    #[serde(default)]
+    pub mask: Option<MaskStrategy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -100,6 +105,10 @@ impl SeedyConfig {
                     out.push_str(&format!("      {col_name}:\n"));
                     if let Some(gen) = &col_config.generator {
                         out.push_str(&format!("        generator: {gen}\n"));
+                    }
+                    if let Some(mask) = col_config.mask {
+                        let s = serde_yaml_ng::to_string(&mask).unwrap_or_default();
+                        out.push_str(&format!("        mask: {}\n", s.trim()));
                     }
                 }
             }
