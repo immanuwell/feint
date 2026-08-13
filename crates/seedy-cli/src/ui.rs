@@ -39,3 +39,31 @@ pub fn table_bar(table: &str, total: u64) -> ProgressBar {
     pb.set_message(table.to_string());
     pb
 }
+
+/// Comma-group a row count for display, e.g. `23410` -> `"23,410"`.
+pub fn format_count(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out.chars().rev().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_thousands_separators() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(42), "42");
+        assert_eq!(format_count(999), "999");
+        assert_eq!(format_count(1000), "1,000");
+        assert_eq!(format_count(23_410), "23,410");
+        assert_eq!(format_count(1_234_567), "1,234,567");
+    }
+}

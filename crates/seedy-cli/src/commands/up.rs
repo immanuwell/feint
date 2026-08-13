@@ -72,7 +72,7 @@ pub async fn run(
     println!();
     ui::check(format!(
         "{} rows generated in {:.1}s",
-        summary.total_rows,
+        ui::format_count(summary.total_rows),
         elapsed.as_secs_f64()
     ));
     ui::check("All constraints valid");

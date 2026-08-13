@@ -61,6 +61,23 @@ pub async fn run(database_url: &str, config_path: &Path, schemas: &[String]) -> 
         ));
     }
 
+    let mut sensitive: Vec<(String, &'static str)> = Vec::new();
+    for table in &schema.tables {
+        for column in &table.columns {
+            if let Some(kind) = seedy_core::generate::classify_sensitive(&column.name) {
+                sensitive.push((format!("{}.{}", table.id.name, column.name), kind));
+            }
+        }
+    }
+    if !sensitive.is_empty() {
+        println!();
+        ui::heading("Sensitive fields detected:");
+        let width = sensitive.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+        for (name, kind) in &sensitive {
+            println!("  {name:<width$}  {kind}");
+        }
+    }
+
     let config = SeedyConfig::from_schema(&schema);
     config.save_annotated(&schema, config_path)?;
     println!();

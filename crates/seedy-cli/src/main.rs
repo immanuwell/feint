@@ -27,6 +27,17 @@ enum Command {
         #[arg(long = "schema", default_value = "public")]
         schemas: Vec<String>,
     },
+    /// Show the FK dependency tree, insertion order, and row estimates without touching the database.
+    Plan {
+        /// Postgres connection URL to introspect.
+        database_url: String,
+        /// Config file to read row counts from, if present.
+        #[arg(long, default_value = "seedy.yaml")]
+        config: std::path::PathBuf,
+        /// Schema(s) to introspect. Repeat to include more than one.
+        #[arg(long = "schema", default_value = "public")]
+        schemas: Vec<String>,
+    },
     /// Generate deterministic synthetic data per seedy.yaml and insert it.
     Up {
         /// Postgres connection URL to insert into.
@@ -52,6 +63,11 @@ async fn main() -> anyhow::Result<()> {
             config,
             schemas,
         } => commands::init::run(&database_url, &config, &schemas).await,
+        Command::Plan {
+            database_url,
+            config,
+            schemas,
+        } => commands::plan::run(&database_url, &config, &schemas).await,
         Command::Up {
             database_url,
             config,

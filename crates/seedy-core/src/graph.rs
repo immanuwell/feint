@@ -6,13 +6,41 @@
 //! satisfiable via deferred constraints, null-then-backfill, or is a hard
 //! error the user needs to fix in their schema.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use petgraph::algo::{tarjan_scc, toposort};
 use petgraph::graph::{DiGraph, NodeIndex};
 
 use crate::error::{Result, SeedyError};
 use crate::introspect::{ForeignKey, Schema, TableId};
+
+/// Build the FK dependency DAG: an edge `parent -> child` means "parent
+/// must be inserted before child" (child holds the FK column referencing
+/// parent). Shared by [`plan_insertion`] and [`dependency_tree`] so both
+/// see exactly the same graph.
+fn build_graph(schema: &Schema) -> (DiGraph<TableId, ()>, HashMap<TableId, NodeIndex>) {
+    let mut node_of: HashMap<TableId, NodeIndex> = HashMap::new();
+    let mut graph: DiGraph<TableId, ()> = DiGraph::new();
+
+    for table in &schema.tables {
+        let idx = graph.add_node(table.id.clone());
+        node_of.insert(table.id.clone(), idx);
+    }
+
+    for table in &schema.tables {
+        let Some(&child_idx) = node_of.get(&table.id) else {
+            continue;
+        };
+        for fk in &table.foreign_keys {
+            let Some(&parent_idx) = node_of.get(&fk.ref_table) else {
+                continue;
+            };
+            graph.add_edge(parent_idx, child_idx, ());
+        }
+    }
+
+    (graph, node_of)
+}
 
 #[derive(Debug, Clone)]
 pub struct FkRef {
@@ -54,28 +82,7 @@ pub struct InsertPlan {
 }
 
 pub fn plan_insertion(schema: &Schema) -> Result<InsertPlan> {
-    let mut node_of: HashMap<TableId, NodeIndex> = HashMap::new();
-    let mut graph: DiGraph<TableId, ()> = DiGraph::new();
-
-    for table in &schema.tables {
-        let idx = graph.add_node(table.id.clone());
-        node_of.insert(table.id.clone(), idx);
-    }
-
-    for table in &schema.tables {
-        let Some(&child_idx) = node_of.get(&table.id) else {
-            continue;
-        };
-        for fk in &table.foreign_keys {
-            let Some(&parent_idx) = node_of.get(&fk.ref_table) else {
-                // FK targets a table outside the introspected set (e.g. a
-                // different, unscanned schema) — nothing seedy can do
-                // about ordering it, so skip rather than fail the whole run.
-                continue;
-            };
-            graph.add_edge(parent_idx, child_idx, ());
-        }
-    }
+    let (graph, _node_of) = build_graph(schema);
 
     let sccs = tarjan_scc(&graph);
     let mut scc_of: HashMap<NodeIndex, usize> = HashMap::new();
@@ -175,6 +182,98 @@ pub fn plan_insertion(schema: &Schema) -> Result<InsertPlan> {
     }
 
     Ok(InsertPlan { groups })
+}
+
+#[derive(Debug, Clone)]
+pub struct TreeNode {
+    pub table: TableId,
+    /// True if this node is shown again lower in a branch that already
+    /// contains it (an FK cycle) — rendering stops descending here rather
+    /// than looping forever.
+    pub cyclic_ref: bool,
+    pub children: Vec<TreeNode>,
+}
+
+/// Render the FK graph as a forest for display (`seedy plan`): one tree
+/// per table with no FK dependencies of its own (a "base" table), with
+/// each table nested under every table whose FK points to it. Tables can
+/// legitimately have more than one parent (it's a DAG, not a tree), so a
+/// table may appear under more than one branch — that's expected, not a
+/// bug, and matches how most dependency-tree visualizations handle a DAG.
+pub fn dependency_tree(schema: &Schema) -> Vec<TreeNode> {
+    let (graph, node_of) = build_graph(schema);
+
+    let mut in_degree: HashMap<NodeIndex, usize> = HashMap::new();
+    for idx in graph.node_indices() {
+        in_degree.insert(idx, 0);
+    }
+    for edge in graph.raw_edges() {
+        *in_degree.entry(edge.target()).or_insert(0) += 1;
+    }
+
+    fn build(
+        graph: &DiGraph<TableId, ()>,
+        node: NodeIndex,
+        path: &mut HashSet<NodeIndex>,
+    ) -> TreeNode {
+        let table = graph[node].clone();
+        if !path.insert(node) {
+            return TreeNode {
+                table,
+                cyclic_ref: true,
+                children: vec![],
+            };
+        }
+        let mut children: Vec<NodeIndex> = graph
+            .neighbors_directed(node, petgraph::Direction::Outgoing)
+            .collect();
+        children.sort_by(|a, b| graph[*a].qualified().cmp(&graph[*b].qualified()));
+        let children = children
+            .into_iter()
+            .map(|c| build(graph, c, path))
+            .collect();
+        path.remove(&node);
+        TreeNode {
+            table,
+            cyclic_ref: false,
+            children,
+        }
+    }
+
+    let mut roots: Vec<NodeIndex> = in_degree
+        .iter()
+        .filter(|(_, &deg)| deg == 0)
+        .map(|(&idx, _)| idx)
+        .collect();
+    roots.sort_by(|a, b| graph[*a].qualified().cmp(&graph[*b].qualified()));
+
+    let mut path = HashSet::new();
+    let mut forest: Vec<TreeNode> = roots.iter().map(|&r| build(&graph, r, &mut path)).collect();
+
+    // Tables that are part of a cycle with no external root (every member
+    // has in-degree > 0 only from within its own SCC) would otherwise
+    // never appear — surface each such SCC once via an arbitrary member.
+    let mut visited: HashSet<TableId> = HashSet::new();
+    fn collect_visited(node: &TreeNode, visited: &mut HashSet<TableId>) {
+        visited.insert(node.table.clone());
+        for c in &node.children {
+            collect_visited(c, visited);
+        }
+    }
+    for node in &forest {
+        collect_visited(node, &mut visited);
+    }
+    for table in &schema.tables {
+        if !visited.contains(&table.id) {
+            let idx = node_of[&table.id];
+            let mut path = HashSet::new();
+            let node = build(&graph, idx, &mut path);
+            collect_visited(&node, &mut visited);
+            forest.push(node);
+        }
+    }
+
+    forest
 }
 
 #[cfg(test)]

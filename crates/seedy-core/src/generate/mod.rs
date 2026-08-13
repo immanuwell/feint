@@ -77,6 +77,41 @@ fn name_heuristic(column_name: &str) -> Option<&'static str> {
     }
 }
 
+/// Broader PII-pattern detector used only for the `seedy init` "sensitive
+/// fields detected" banner — informational, not a masking decision (there
+/// is no masking in GENERATE mode: every value is synthetic regardless).
+/// Deliberately wider than [`name_heuristic`], which only covers the
+/// patterns that map to a specific generator.
+pub fn classify_sensitive(column_name: &str) -> Option<&'static str> {
+    let n = column_name.to_ascii_lowercase();
+    if n.contains("email") {
+        Some("email")
+    } else if n.contains("phone") {
+        Some("phone")
+    } else if n == "name" || n == "full_name" || n.ends_with("_name") {
+        Some("person_name")
+    } else if n.contains("ssn") || n.contains("social_security") {
+        Some("ssn")
+    } else if n.contains("passport")
+        || n.contains("license")
+        || n.contains("national_id")
+        || n.contains("card")
+        || n.contains("cvv")
+        || n.contains("iban")
+        || n.contains("account_number")
+    {
+        Some("potential_identifier")
+    } else if n.contains("address") || n.contains("street") {
+        Some("address")
+    } else if n.contains("dob") || n.contains("birth_date") || n.contains("date_of_birth") {
+        Some("date_of_birth")
+    } else if n == "ip" || n.contains("ip_address") {
+        Some("ip_address")
+    } else {
+        None
+    }
+}
+
 fn dispatch_by_type(
     type_name: &str,
     type_kind: &TypeKind,
