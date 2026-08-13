@@ -6,6 +6,9 @@ members = ["crates/seedy-core", "crates/seedy-cli"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+description = "Deterministic, Postgres-native synthetic test data"
+keywords = ["postgres", "postgresql", "database", "seed", "testing"]
+categories = ["command-line-utilities", "database"]
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
