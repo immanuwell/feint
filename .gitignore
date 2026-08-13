@@ -1,0 +1,14 @@
+/target
+seedy.yaml
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+
+# OS cruft
+.DS_Store
+
+# Local env / secrets
+.env
+.env.*
