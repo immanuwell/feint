@@ -12,9 +12,9 @@ feint is a command line tool for Postgres. It has three modes.
 
 **Mask** rewrites a database's own sensitive columns in place, on that same database, no second database involved. Command: `mask`. This is for a workflow clone can't cover: a database that already got a full physical copy from somewhere else (a cloud snapshot restore is the common case), and now needs its own PII scrubbed before anyone treats it as safe to use.
 
-Alongside the three modes, `feint migrate` converts another tool's config (Snaplet Seed, Neosync) into a starting `feint.yaml`, so switching tools doesn't mean starting from a blank file.
+Alongside the three modes, `feint migrate` converts another tool's config (Snaplet Seed, Neosync) into a starting `feint.yaml`, so switching tools doesn't mean starting from a blank file. `feint policy` writes ready-made masking rules for a data domain (PII, healthcare, payments) into a config, so you don't write every `mask:` override by hand.
 
-`plan` only reads your schema, it never writes anything. `migrate` only reads a config file, never a database. `init`, `up`, `clone`, and `mask` all touch a database.
+`plan` only reads your schema, it never writes anything. `migrate` only reads a config file, never a database. `policy list` reads nothing at all. `init`, `up`, `clone`, `mask`, and `policy apply` all touch a database.
 
 ## Install
 
@@ -158,6 +158,28 @@ Converts another tool's config into a `feint.yaml`, as a starting point. Best ef
 - Custom code (JavaScript transformers, user-defined transformers) has no feint equivalent and is reported as needing manual review, not written to the output.
 
 Neither converter touches a database. Both only read the input file and write a `feint.yaml`. Run `feint plan` against your actual database afterward to check the result matches your real schema before running `up`, `clone`, or `mask` with it.
+
+### feint policy
+
+```
+feint policy list
+feint policy apply <NAME> <DATABASE_URL> [--config <PATH>] [--schema <NAME>]... [--force]
+```
+
+Prebuilt masking rules for a data domain, so you don't write every `mask:` override in `feint.yaml` by hand. `feint policy list` prints the available templates. `feint policy apply` connects to your database, finds columns matching the template's patterns, and writes `mask:` (and, where one applies, `generator:`) into the config file.
+
+Built-in policies:
+
+- `pii`. Names, contact details, government IDs, dates of birth, addresses.
+- `healthcare`. Medical record numbers, diagnoses, medications, patient identity, policy numbers.
+- `payments`. Card numbers, CVVs, account and routing numbers, cardholder identity.
+
+A policy is a starting point, not a compliance certification. It matches on column name patterns, the same kind of heuristic [Sensitive field detection](#sensitive-field-detection) uses, so review what it applied before trusting it with real data. Use `--config` on a fresh path first if you want to inspect the result before overwriting an existing file.
+
+Two rules, same as everywhere else in masking:
+
+- A primary key or foreign key column is never matched, even if its name looks sensitive. `feint policy apply` reports how many columns were skipped for this reason.
+- A column that already has an explicit `mask:` set is left alone, so applying a policy never silently overwrites a choice you already made by hand. Pass `--force` to overwrite anyway. This also means you can apply more than one policy to the same config: run `pii` then `payments`, and columns both would touch (like `email`) keep whichever policy set them first.
 
 ## Masking
 
@@ -418,6 +440,7 @@ The test suite includes:
 - A smoke test that runs the actual compiled binary through `init` and `up`.
 - `correctness_demo`, a single narrated run over every nasty-schema fixture in order, printing a clean pass/fail report. Run it yourself with `cargo test --test correctness_demo -- --nocapture`. This is the source of the transcript in the README.
 - `cross_mode_identity`, which clones a database with masking and separately masks an independent copy of the same source data in place, then asserts both runs produced byte-identical fake values for every row. This is what backs the claim in [Deterministic identity](#deterministic-identity).
+- `policy_apply`, which applies a policy template, runs the resulting config through `mask` against a real database, and checks the masked values: a redact-mapped column actually comes back null, an unmatched column passes through untouched, and applying a second policy doesn't overwrite the first policy's choices.
 
 ## Roadmap
 

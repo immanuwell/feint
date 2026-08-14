@@ -149,6 +149,8 @@ feint up postgres://localhost/myapp
 
 **Migrate**: `feint migrate snaplet` / `feint migrate neosync`. Converts a Snaplet Seed or Neosync config into a starting `feint.yaml`. Best effort, prints what converted and what needs a manual look.
 
+**Policy**: `feint policy list` / `feint policy apply`. Ready-made masking rules for a data domain (PII, healthcare, payments), written into your config instead of typed by hand. Never touches a primary or foreign key, never overwrites a `mask:` you already set.
+
 `clone` needs a live connection to both databases at once. There's no separate "snapshot to a file, restore it later" step yet. See `DOCS.md` for the full roadmap.
 
 ## Full docs

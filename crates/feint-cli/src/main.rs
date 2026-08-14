@@ -100,6 +100,33 @@ enum Command {
         #[command(subcommand)]
         tool: MigrateTool,
     },
+    /// Prebuilt masking policy templates for common data domains (PII, healthcare, payments).
+    Policy {
+        #[command(subcommand)]
+        action: PolicyAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum PolicyAction {
+    /// List the available policy templates.
+    List,
+    /// Apply a policy template's mask overrides to a config file.
+    Apply {
+        /// Policy name, e.g. pii, healthcare, payments. See `feint policy list`.
+        name: String,
+        /// Postgres connection URL to introspect.
+        database_url: String,
+        /// Config file to update, or create if it doesn't exist.
+        #[arg(long, default_value = "feint.yaml")]
+        config: std::path::PathBuf,
+        /// Schema(s) to introspect. Repeat to include more than one.
+        #[arg(long = "schema", default_value = "public")]
+        schemas: Vec<String>,
+        /// Overwrite columns that already have an explicit mask: set.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -183,6 +210,19 @@ async fn main() -> anyhow::Result<()> {
             MigrateTool::Neosync { job_json, output } => {
                 commands::migrate::run_neosync(&job_json, &output).await
             }
+        },
+        Command::Policy { action } => match action {
+            PolicyAction::List => {
+                commands::policy::list();
+                Ok(())
+            }
+            PolicyAction::Apply {
+                name,
+                database_url,
+                config,
+                schemas,
+                force,
+            } => commands::policy::apply(&name, &database_url, &config, &schemas, force).await,
         },
     }
 }
