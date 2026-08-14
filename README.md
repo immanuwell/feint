@@ -145,7 +145,7 @@ feint up postgres://localhost/myapp
 
 **Clone**: `feint clone`. Copies real rows from a source database to a target database, keeping keys intact and masking sensitive columns. Add `--root` to copy only a subset instead of the whole database.
 
-**Mask**: `feint mask`. Rewrites a single database's own sensitive columns in place. No second database. This is the right tool when a database already got a full copy from somewhere else (a cloud snapshot restore, most commonly) and now needs its own PII scrubbed. Batched, resumable if interrupted, with a dry run and a confirmation step before it writes anything.
+**Mask**: `feint mask`. Rewrites a single database's own sensitive columns in place. No second database. This is the right tool when a database already got a full copy from somewhere else (a cloud snapshot restore, most commonly) and now needs its own PII scrubbed. Batched, resumable if interrupted, with a dry run and a confirmation step before it writes anything, and a post-mask verification pass that re-checks the result before calling it done.
 
 **Migrate**: `feint migrate snaplet` / `feint migrate neosync`. Converts a Snaplet Seed or Neosync config into a starting `feint.yaml`. Best effort, prints what converted and what needs a manual look.
 

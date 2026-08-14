@@ -182,7 +182,7 @@ pub fn mask_value(
     }
 }
 
-fn redact_literal(column: &Column) -> PgValue {
+pub(crate) fn redact_literal(column: &Column) -> PgValue {
     match column.type_name.as_str() {
         "bool" => PgValue::Bool(false),
         "int2" => PgValue::Int2(0),

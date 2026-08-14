@@ -12,6 +12,7 @@ pub mod policy;
 pub mod sanitize;
 pub mod subset;
 pub mod value;
+pub mod verify;
 
 pub use error::{FeintError, Result};
 pub use value::PgValue;

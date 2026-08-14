@@ -113,7 +113,7 @@ On success, `clone` prints the row count per table and confirms that keys were p
 ### feint mask
 
 ```
-feint mask <DATABASE_URL> [--config <PATH>] [--schema <NAME>]... [--batch-size N] [--dry-run] [--yes] [--resume] [--max-batches N]
+feint mask <DATABASE_URL> [--config <PATH>] [--schema <NAME>]... [--batch-size N] [--dry-run] [--yes] [--resume] [--max-batches N] [--skip-verify]
 ```
 
 Rewrites a single database's own sensitive columns in place. One connection, read and write. No second database, no key remapping, no row inserted or deleted, ever, only `UPDATE` on existing columns.
@@ -127,12 +127,25 @@ This is for a case `clone` does not cover: a database that already has a full, r
 - `--yes` skips the interactive confirmation prompt. Without it, `mask` prints the exact target and table/column list and asks you to type "yes" before writing anything. Needed for scripted or CI use.
 - `--resume` continues a previous run that stopped partway through (crashed, was killed, or hit `--max-batches`), picking up exactly where it left off. Without `--resume`, a run refuses to start at all if it finds unfinished progress from an earlier attempt. You have to choose to continue it, feint will not guess.
 - `--max-batches N` stops the whole run after N batches, leaving a valid, resumable checkpoint. Useful for pacing a very large run across more than one invocation. Unlimited if omitted.
+- `--skip-verify` skips the post-mask verification pass described below. On by default.
 
 `mask` tracks its own progress in a small table it creates on the target, `_feint_mask_checkpoint`, one row per table it has touched. This is what makes `--resume` safe: each batch's `UPDATE` and its checkpoint update commit together, in the same transaction, so a row is read and masked exactly once, ever, no matter how many times a run gets interrupted and resumed. This matters specifically for the `hash` strategy, which is keyed off a column's real value. Re-masking an already-masked row would hash the masked output instead of the original, which is exactly what the checkpoint is there to prevent.
 
 Before and after masking each table, `mask` checks the row count is unchanged. `mask` only ever runs `UPDATE`. A row-count mismatch is a hard error, not a warning, since it would mean something else wrote to the table while masking was running.
 
-On success, `mask` prints the row count masked per table and confirms row counts and keys were untouched.
+On success, `mask` prints the row count masked per table and confirms row counts and keys were untouched, then runs a post-mask verification pass and prints its result too.
+
+#### Post-mask verification
+
+After masking commits, `mask` re-reads the database and checks that each masked column's values have the shape masking should have produced:
+
+- A `redact`-masked column: every value is null (if the column is nullable) or exactly the expected placeholder (if not).
+- A `hash`-masked column: every value matches the `masked_<hex>` format.
+- A `fake`-masked column: not every row shares the exact same value. On its own this doesn't prove a value is fake, but if every row in a column that should vary per row has collapsed to one identical value, the per-row identity keying broke, and that is worth knowing before you trust the database.
+
+This is not a content-based PII detector. It cannot tell you whether a `fake` value merely looks like a real name. What it catches is pipeline bugs: a batch that silently didn't get processed, a malformed hash, a column that should have been nulled out but wasn't. Defense in depth on top of masking itself, not a replacement for reviewing what you configured.
+
+If verification finds an issue, `mask` reports it and exits with an error, even though the masking run itself already committed successfully. The two are separate: your data is masked and the row-count/key guarantees above still hold, but verification is telling you something about the *result* looks wrong and needs a look before you treat the database as safe.
 
 ### feint migrate
 
@@ -441,6 +454,7 @@ The test suite includes:
 - `correctness_demo`, a single narrated run over every nasty-schema fixture in order, printing a clean pass/fail report. Run it yourself with `cargo test --test correctness_demo -- --nocapture`. This is the source of the transcript in the README.
 - `cross_mode_identity`, which clones a database with masking and separately masks an independent copy of the same source data in place, then asserts both runs produced byte-identical fake values for every row. This is what backs the claim in [Deterministic identity](#deterministic-identity).
 - `policy_apply`, which applies a policy template, runs the resulting config through `mask` against a real database, and checks the masked values: a redact-mapped column actually comes back null, an unmatched column passes through untouched, and applying a second policy doesn't overwrite the first policy's choices.
+- `verify_masking`, which confirms the post-mask verification pass stays quiet after a real, correct mask run, then corrupts the masked data directly (a broken hash, a non-redacted value, every row's fake value collapsed to one) and confirms verification catches each one specifically.
 
 ## Roadmap
 
@@ -451,7 +465,6 @@ Not built yet:
 - **Table aware sensitive field detection**, so a `name` column is treated differently on a `users` table versus an `organizations` table.
 - **Snapshot files.** `clone` currently needs a live connection to both the source and target database at once. A `snapshot` / `restore` split, where you extract once to a file and load it later without needing source access again, is not built.
 - **Full TLS certificate verification** (`verify-ca`/`verify-full`), for setups that need it rather than just an encrypted connection.
-- **Post-mask verification pass.** A second, independent check after `mask` completes, re-running the sensitive-field detection against the masked values to confirm they no longer look like real data, as defense in depth on top of the masking itself.
 
 ## License
 

@@ -5,6 +5,7 @@ use std::path::Path;
 use feint_core::config::FeintConfig;
 use feint_core::introspect;
 use feint_core::sanitize::{self, ProgressEvent};
+use feint_core::verify;
 use tokio_postgres::config::Host;
 
 use crate::ui;
@@ -19,6 +20,7 @@ pub async fn run(
     yes: bool,
     resume: bool,
     max_batches: Option<usize>,
+    skip_verify: bool,
 ) -> anyhow::Result<()> {
     let config = if config_path.exists() {
         FeintConfig::load(config_path)?
@@ -155,6 +157,36 @@ pub async fn run(
     ));
     ui::check("Row counts unchanged on every table");
     ui::check("Primary keys and foreign keys untouched");
+
+    if !skip_verify {
+        println!();
+        let spinner = ui::spinner("Verifying masked values...");
+        let findings = verify::verify_masking(&client, &schema, &plan).await?;
+        spinner.finish_and_clear();
+
+        if findings.is_empty() {
+            ui::check("Verification: every masked column looks correctly masked");
+        } else {
+            let count = findings.len();
+            ui::error(format!(
+                "Verification found {count} issue(s) — masking may not have applied cleanly:"
+            ));
+            for f in &findings {
+                ui::error(format!(
+                    "  {}.{} ({}): {}",
+                    f.table,
+                    f.column,
+                    strategy_label(f.strategy),
+                    f.issue
+                ));
+            }
+            anyhow::bail!(
+                "{count} column(s) failed post-mask verification. The masking run itself \
+                 completed and committed (see above) — this is a separate check on top of it. \
+                 Investigate before treating this database as safe."
+            );
+        }
+    }
 
     Ok(())
 }

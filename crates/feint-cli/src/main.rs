@@ -94,6 +94,10 @@ enum Command {
         /// --resume from later. Useful for pacing a very large run. Unlimited if omitted.
         #[arg(long)]
         max_batches: Option<usize>,
+        /// Skip the post-mask verification pass (re-checks masked values match the strategy
+        /// that was applied). On by default; skip only if the extra queries are too costly.
+        #[arg(long)]
+        skip_verify: bool,
     },
     /// Convert another tool's config to feint.yaml. Best effort — review the report before using the output.
     Migrate {
@@ -188,6 +192,7 @@ async fn main() -> anyhow::Result<()> {
             yes,
             resume,
             max_batches,
+            skip_verify,
         } => {
             commands::mask::run(
                 &database_url,
@@ -198,6 +203,7 @@ async fn main() -> anyhow::Result<()> {
                 yes,
                 resume,
                 max_batches,
+                skip_verify,
             )
             .await
         }
