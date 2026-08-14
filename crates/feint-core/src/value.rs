@@ -16,9 +16,16 @@ use bytes::BytesMut;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use postgres_types::{FromSql, IsNull, Kind, ToSql, Type};
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, PartialEq)]
+/// `Serialize`/`Deserialize` back `snapshot.rs`'s file format: a snapshot
+/// captures exactly the already-masked values a `clone` run would have
+/// written, so replaying them at restore time needs no repeat trip to a
+/// source database. `rust_decimal`'s `serde-str` feature is load-bearing
+/// here — `Decimal`'s default serde representation round-trips through
+/// self-describing formats but not through bincode's compact binary one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PgValue {
     Null,
     Bool(bool),
@@ -34,7 +41,10 @@ pub enum PgValue {
     Timestamp(NaiveDateTime),
     TimestampTz(DateTime<Utc>),
     Date(NaiveDate),
-    Json(serde_json::Value),
+    /// Serialized as its JSON text, not as `serde_json::Value` directly:
+    /// `Value`'s `Deserialize` impl needs `deserialize_any`, which bincode
+    /// (a fixed, non-self-describing format) cannot provide.
+    Json(#[serde(with = "json_as_string")] serde_json::Value),
     /// Homogeneous array of values, rendered via Postgres array-literal
     /// text syntax (`{a,b,c}`) rather than the binary array wire format —
     /// simpler and correct for any element type, at a small perf cost.
@@ -115,6 +125,19 @@ impl PgValue {
 
     pub fn is_null(&self) -> bool {
         matches!(self, PgValue::Null)
+    }
+}
+
+mod json_as_string {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &serde_json::Value, s: S) -> Result<S::Ok, S::Error> {
+        value.to_string().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<serde_json::Value, D::Error> {
+        let text = String::deserialize(d)?;
+        serde_json::from_str(&text).map_err(serde::de::Error::custom)
     }
 }
 
@@ -307,5 +330,51 @@ mod tests {
     fn raw_literal_passes_through() {
         let v = PgValue::Raw("192.168.1.0/24".to_string());
         assert_eq!(v.as_text_literal(), "192.168.1.0/24");
+    }
+
+    /// `snapshot.rs`'s file format bincode-serializes `PgValue` directly,
+    /// so every variant must round-trip through it byte-exact, not just
+    /// through the wire-format tests above. `Decimal` is the one variant
+    /// with a documented gap here (its default serde repr doesn't survive
+    /// bincode) — this is exactly what the `serde-str` feature fixes, and
+    /// this test would fail without it.
+    #[test]
+    fn every_variant_round_trips_through_bincode() {
+        let values = vec![
+            PgValue::Null,
+            PgValue::Bool(true),
+            PgValue::Bool(false),
+            PgValue::Int2(-7),
+            PgValue::Int4(-42),
+            PgValue::Int8(9_000_000_000),
+            PgValue::Numeric(Decimal::new(123456, 3)),
+            PgValue::Float4(1.5),
+            PgValue::Float8(2.25),
+            PgValue::Text("hello, world".to_string()),
+            PgValue::Bytea(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            PgValue::Uuid(Uuid::new_v4()),
+            PgValue::Timestamp(
+                NaiveDate::from_ymd_opt(2026, 8, 14)
+                    .unwrap()
+                    .and_hms_opt(1, 2, 3)
+                    .unwrap(),
+            ),
+            PgValue::TimestampTz(DateTime::from_timestamp(1_723_000_000, 0).unwrap()),
+            PgValue::Date(NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()),
+            PgValue::Json(serde_json::json!({"a": 1, "b": [true, null]})),
+            PgValue::Array(vec![PgValue::Int4(1), PgValue::Null, PgValue::Int4(3)]),
+            PgValue::Enum("mood".to_string(), "happy".to_string()),
+            PgValue::Raw("192.168.1.0/24".to_string()),
+        ];
+
+        for v in values {
+            let bytes = bincode::serialize(&v).unwrap_or_else(|e| {
+                panic!("failed to serialize {v:?}: {e}");
+            });
+            let decoded: PgValue = bincode::deserialize(&bytes).unwrap_or_else(|e| {
+                panic!("failed to deserialize {v:?}: {e}");
+            });
+            assert_eq!(v, decoded, "round trip changed the value");
+        }
     }
 }

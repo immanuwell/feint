@@ -58,7 +58,7 @@ pub(crate) fn needs_overriding_system_value(columns: &[&Column]) -> bool {
 /// `Some` for a `--root`-subsetted clone, in which case the rows for this
 /// table were already selected by `subset::compute_subset` and are used
 /// as-is (a table absent from the map contributes zero rows).
-async fn read_table_rows(
+pub(crate) async fn read_table_rows(
     source_txn: &Transaction<'_>,
     table: &Table,
     columns: &[&Column],
@@ -93,7 +93,7 @@ async fn read_table_rows(
 /// pristine (pre-mask) values for the identity key so `fake` masking
 /// stays keyed on the real source row regardless of which other columns
 /// in the same row already got masked.
-fn mask_rows(
+pub(crate) fn mask_rows(
     table: &Table,
     columns: &[&Column],
     rows: Vec<Vec<PgValue>>,
@@ -133,7 +133,7 @@ fn mask_rows(
         .collect()
 }
 
-fn table_strategy(config: &FeintConfig, table_id: &TableId) -> TableStrategy {
+pub(crate) fn table_strategy(config: &FeintConfig, table_id: &TableId) -> TableStrategy {
     config
         .table_config(&table_id.qualified())
         .map(|t| t.strategy)
@@ -210,7 +210,7 @@ fn validate_hybrid_config(schema: &Schema, config: &FeintConfig, plan: &InsertPl
 /// `register_returned`, no `RETURNING` round trip is needed — CLONE mode
 /// preserves the source's real primary/unique key values, known before
 /// any target write happens.
-fn register_rows_in_ref_pool(
+pub(crate) fn register_rows_in_ref_pool(
     ref_pool: &mut RefPool,
     table: &Table,
     columns: &[&Column],
@@ -245,7 +245,7 @@ fn pgvalue_as_i64(value: &PgValue) -> Option<i64> {
 /// against the target collides with a duplicate key. Runs once per table
 /// right after that table's rows are written, using the max value already
 /// in hand rather than a follow-up `SELECT MAX(...)`.
-async fn resync_sequences(
+pub(crate) async fn resync_sequences(
     target_txn: &Transaction<'_>,
     table: &Table,
     columns: &[&Column],

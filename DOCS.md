@@ -111,6 +111,37 @@ Primary keys and foreign keys are preserved exactly as they are on the source. T
 
 On success, `clone` prints the row count per table and confirms that keys were preserved.
 
+### feint snapshot
+
+```
+feint snapshot <SOURCE_URL> --output <PATH> [--root "<table> WHERE <condition>"] [--config <PATH>] [--schema <NAME>]...
+```
+
+Reads real rows from `SOURCE_URL`, masks them exactly the way `clone` would, and writes the result to a single file instead of a target database. No target connection is needed at all for this step.
+
+- `<SOURCE_URL>` is only ever read from, same read-only guarantee as `clone`.
+- `--output <PATH>` sets where the snapshot file is written.
+- `--root`, `--config`, `--schema` all mean exactly what they mean for `clone`.
+
+A table with `strategy: generate` (see [Hybrid clone](#hybrid-clone-mask--generate-in-one-run)) is rejected before anything is read: a generate-strategy table's rows need a live target connection to resolve server-assigned columns via `RETURNING`, which a file replay can't provide. Snapshot a database with only `mask`-strategy tables, or remove the `strategy:` override for this run.
+
+The file is gzip-compressed bincode, feint's own format, not meant for anything other than a later `feint restore`. It carries the already-masked row data and column names only, nothing about insertion order or foreign-key handling: `restore` recomputes that fresh from the target's own schema, which is what keeps the file small and keeps both sides trivially consistent with whatever the target schema actually is at restore time.
+
+### feint restore
+
+```
+feint restore <SNAPSHOT_FILE> <TARGET_URL>
+```
+
+Loads a file written by `feint snapshot` into `TARGET_URL`, inside one transaction, same all-or-nothing guarantee as `clone`. No `--config` or `--schema` needed: the file already carries the finished, masked values, so there's nothing left to configure, and it already knows which schemas it touched.
+
+- `<SNAPSHOT_FILE>` a path written by `feint snapshot`.
+- `<TARGET_URL>` is written to. Same requirement as `clone`: matching tables must already exist.
+
+`restore` introspects the target's own schema and builds a fresh insertion plan from it, the same way `clone` builds one from the source on every run. If the target schema drifted since the snapshot was captured (a column renamed, added, or removed), `restore` rejects the mismatched table with a clear error rather than guessing at a mapping. A table the snapshot has no data for (for instance, one outside a `--root` snapshot's subset) is left empty, the same way `--root` leaves an unrelated table empty on a live `clone`.
+
+A snapshot file's format is versioned. A file written by a newer feint than the one running `restore` is rejected with a clear error rather than misread.
+
 ### feint mask
 
 ```
@@ -315,6 +346,8 @@ Two things `--strict` does not do:
 ## CI and scripted use
 
 `mask` and `classify` are both meant to run unattended: on a schedule, in a pipeline step, right after a snapshot restore. This section is the contract a script can rely on.
+
+**Build once, restore per job.** `feint snapshot`/`feint restore` (see the command reference above) split capturing a masked database from loading it, specifically for this. Run `feint snapshot` once, on a schedule or whenever the source changes meaningfully, commit or cache the resulting file, then have every CI job (per PR, per branch, whatever the pipeline needs) run `feint restore` against its own throwaway database. Every job gets an identical, already-masked dataset without re-reading the source or re-running masking N times.
 
 **Exit codes.** 0 means success. Any non-zero exit means something needs attention: a config error, a rejected masking config, an aborted confirmation, a post-mask verification failure, a `--strict` refusal, or a `--check` drift. feint does not currently distinguish failure reasons by exit code number, only by 0 versus non-zero, so a script should treat any non-zero exit as "stop, don't trust this database yet" and read stderr for why.
 
@@ -568,6 +601,8 @@ This detection is based on column name patterns only. It does not know what the 
 - `mask` requires a primary key on any table it needs to touch (see [Masking](#masking)).
 - `--strict` (see [Fail-closed masking](#fail-closed-masking---strict)) guarantees every column's classification was reviewed at least once, not that the naming heuristic behind that classification is correct. It will not catch PII in a column the heuristic itself misses.
 - `migrate` cannot convert arbitrary custom code (Snaplet's `seed.ts` generator functions, Neosync's JavaScript/user-defined transformers). These are reported as needing manual review, not guessed at.
+- `feint snapshot` does not support a `strategy: generate` table (see [Hybrid clone](#hybrid-clone-mask--generate-in-one-run)); it rejects the config rather than only capturing part of a hybrid run.
+- A snapshot file is feint's own versioned format, meant only for a later `feint restore` by a compatible feint build. It is not a portable interchange format, and a file from a newer feint version than the one running `restore` is rejected rather than misread.
 - TLS support covers `sslmode=require`/`prefer` (encrypted, certificate not verified) and `disable` (plain). `verify-ca`/`verify-full` (full certificate chain and hostname verification) are not implemented yet and are rejected with a clear error rather than silently downgraded.
 
 ## Development
@@ -594,6 +629,7 @@ The test suite includes:
 - `policy_apply`, which applies a policy template, runs the resulting config through `mask` against a real database, and checks the masked values: a redact-mapped column actually comes back null, an unmatched column passes through untouched, and applying a second policy doesn't overwrite the first policy's choices.
 - `verify_masking`, which confirms the post-mask verification pass stays quiet after a real, correct mask run, then corrupts the masked data directly (a broken hash, a non-redacted value, every row's fake value collapsed to one) and confirms verification catches each one specifically.
 - `classify_mode`, which checks the classification report and lockfile diff against a real database: sensitive columns detected, key columns excluded, a new column showing up as drift, and an explicit `mask: none` override on a sensitive-looking column being visible in the report rather than silently disappearing. The smoke test also runs the full `feint classify --write` / `--check` / `mask --strict` cycle through the real compiled binary, including the refuse-then-succeed sequence around a drifted column.
+- `snapshot_restore`, which proves the whole point of the split: a snapshot captured from a source container round-trips through a real file on disk, and `restore` never touches the source connection again after `capture` returns (the smoke test goes further and destroys the source container entirely between `snapshot` and `restore`). Also covers a foreign-key cycle surviving the round trip, `strategy: generate` rejected at capture time, `--root` composing with a snapshot, and a schema that drifted between capture and restore being rejected rather than guessed at.
 
 ## Roadmap
 
@@ -602,7 +638,6 @@ Not built yet:
 - **Homebrew tap.** A formula template exists at `packaging/homebrew/feint.rb`, but it needs a real release's checksums before it can go live. See `packaging/homebrew/README.md`.
 - **aarch64 Linux binaries.** The install script and release workflow currently cover x86_64 Linux, and both Intel and Apple Silicon macOS. arm64 Linux (e.g. AWS Graviton, Raspberry Pi) needs to build from source for now.
 - **Table aware sensitive field detection**, so a `name` column is treated differently on a `users` table versus an `organizations` table.
-- **Snapshot files.** `clone` currently needs a live connection to both the source and target database at once. A `snapshot` / `restore` split, where you extract once to a file and load it later without needing source access again, is not built.
 - **Full TLS certificate verification** (`verify-ca`/`verify-full`), for setups that need it rather than just an encrypted connection.
 
 ## License

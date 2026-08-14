@@ -30,7 +30,7 @@ petgraph = "0.6"
 blake3 = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-rust_decimal = { version = "1", features = ["db-tokio-postgres"] }
+rust_decimal = { version = "1", features = ["db-tokio-postgres", "serde-str"] }
 thiserror = "1"
 anyhow = "1"
 native-tls = "0.2"
@@ -41,3 +41,5 @@ testcontainers-modules = { version = "0.11", features = ["postgres"] }
 rstest = "0.23"
 assert_cmd = "2"
 dtor = "1"
+bincode = "1"
+flate2 = "1"

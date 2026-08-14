@@ -75,6 +75,31 @@ enum Command {
         #[arg(long, default_value = feint_core::classify::DEFAULT_LOCKFILE)]
         lockfile: std::path::PathBuf,
     },
+    /// Capture a clone-shaped, masked read of a database into a file, no target database needed yet.
+    Snapshot {
+        /// Postgres connection URL to read from. Only ever queried with SELECT.
+        source_url: String,
+        /// Where to write the snapshot file.
+        #[arg(long)]
+        output: std::path::PathBuf,
+        /// Subset root, e.g. "public.organizations WHERE id = 42". Omit to snapshot the whole database.
+        #[arg(long)]
+        root: Option<String>,
+        /// Config file with masking overrides, if present.
+        #[arg(long, default_value = "feint.yaml")]
+        config: std::path::PathBuf,
+        /// Schema(s) to introspect. Repeat to include more than one.
+        #[arg(long = "schema", default_value = "public")]
+        schemas: Vec<String>,
+    },
+    /// Load a snapshot file into a target database. The target's own schema decides insertion
+    /// order and foreign-key handling — no live connection to the original source is needed.
+    Restore {
+        /// Path to a file written by `feint snapshot`.
+        snapshot_file: std::path::PathBuf,
+        /// Postgres connection URL to write into.
+        target_url: String,
+    },
     /// Mask sensitive columns of a database in place. Row values only — no schema change, no row insert/delete.
     Mask {
         /// Postgres connection URL to mask in place.
@@ -238,6 +263,17 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
+        Command::Snapshot {
+            source_url,
+            output,
+            root,
+            config,
+            schemas,
+        } => commands::snapshot::run(&source_url, &output, root, &config, &schemas).await,
+        Command::Restore {
+            snapshot_file,
+            target_url,
+        } => commands::restore::run(&snapshot_file, &target_url).await,
         Command::Mask {
             database_url,
             config,

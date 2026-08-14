@@ -155,7 +155,7 @@ feint up postgres://localhost/myapp
 
 **Policy**: `feint policy list` / `feint policy apply`. Ready-made masking rules for a data domain (PII, healthcare, payments), written into your config instead of typed by hand. Never touches a primary or foreign key, never overwrites a `mask:` you already set.
 
-`clone` needs a live connection to both databases at once. There's no separate "snapshot to a file, restore it later" step yet. See `DOCS.md` for the full roadmap.
+**Snapshot**: `feint snapshot` / `feint restore`. Captures a `clone`-shaped, masked read of a database into a file, then loads that file into a target database later, no live connection back to the source needed at restore time. Build one snapshot, restore it into as many throwaway databases as you want: a CI job per PR, a contractor's laptop, an air-gapped environment. See `DOCS.md` for the full roadmap.
 
 ## Full docs
 
