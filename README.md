@@ -72,6 +72,37 @@ Row counts unchanged on every table
 Primary keys and foreign keys untouched
 ```
 
+## Correctness
+
+Most generators break on real-world Postgres schemas: composite keys, self-referencing tables, FK cycles, enums, domains, arrays, JSONB, citext, partitioned tables. feint's test suite runs against all of them, in a real Postgres container, every time:
+
+```
+$ cargo test --test correctness_demo -- --nocapture
+
+Nasty Postgres schema correctness check
+========================================
+✓ composite_fk                 60 rows generated, 0 constraint violations
+✓ self_ref_fk                  20 rows generated, 0 constraint violations
+✓ cycle_nullable               40 rows generated, 0 constraint violations
+✓ cycle_deferred               40 rows generated, 0 constraint violations
+✓ enums                        20 rows generated, 0 constraint violations
+✓ domains                      20 rows generated, 0 constraint violations
+✓ arrays                       20 rows generated, 0 constraint violations
+✓ jsonb                        20 rows generated, 0 constraint violations
+✓ citext                       20 rows generated, 0 constraint violations
+✓ inet_cidr                    20 rows generated, 0 constraint violations
+✓ uuid_pk                      20 rows generated, 0 constraint violations
+✓ identity_serial              60 rows generated, 0 constraint violations
+✓ partitioned                  20 rows generated, 0 constraint violations
+✓ cycle_hard_unsatisfiable   correctly rejected before any write
+✓ check_constraints          CHECK constraints introspected and annotated
+
+15/15 nasty schemas handled correctly
+0 constraint violations
+```
+
+That's a real, reproducible test run, not a marketing number. Clone the repo and run the command yourself (needs Docker). See [Supported Postgres features](DOCS.md#supported-postgres-features) for what each case covers and why it's there.
+
 ## Install
 
 You need Rust and Cargo. Get them from [rustup.rs](https://rustup.rs) if you don't have them.

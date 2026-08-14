@@ -379,6 +379,7 @@ The test suite includes:
 - Integration tests with two containers (source and target) for `clone`: key preservation, sequence resync, each masking strategy, the rules that reject unsafe masking configs, and subsetting (a diamond dependency, a self-referencing root, a cap abort).
 - Integration tests for `mask`: batching across many rows, a genuinely interrupted-and-resumed run verified against independently-computed expected output (not just spot-checked), the same unsafe-config rejections as `clone`, and the row-count invariant.
 - A smoke test that runs the actual compiled binary through `init` and `up`.
+- `correctness_demo`, a single narrated run over every nasty-schema fixture in order, printing a clean pass/fail report. Run it yourself with `cargo test --test correctness_demo -- --nocapture`. This is the source of the transcript in the README.
 
 ## Roadmap
 
