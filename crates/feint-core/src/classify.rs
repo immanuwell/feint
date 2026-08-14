@@ -27,7 +27,7 @@ use crate::mask::{is_key_column, resolve_mask_strategy, MaskStrategy};
 pub const DEFAULT_LOCKFILE: &str = "feint.lock.yaml";
 const LOCK_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ColumnClassification {
     /// True if the column name matches feint's sensitive-name heuristic
     /// ([`classify_sensitive`]), regardless of what strategy it resolved to
@@ -41,7 +41,7 @@ pub struct ColumnClassification {
 /// Key columns and stored-generated columns are left out: they can never
 /// resolve to anything but `none` (see [`is_key_column`]), so tracking them
 /// in the lockfile would just be permanent, unactionable noise.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ClassificationReport {
     pub columns: BTreeMap<String, ColumnClassification>,
 }
@@ -126,21 +126,21 @@ impl ClassificationLock {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DriftEntry {
     pub column: String,
     pub sensitive: bool,
     pub strategy: MaskStrategy,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ChangedEntry {
     pub column: String,
     pub old: ColumnClassification,
     pub new: ColumnClassification,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ClassificationDiff {
     /// Columns that exist now but were absent from the lockfile entirely —
     /// e.g. a new column any engineer just added.

@@ -19,6 +19,7 @@ clap = { workspace = true }
 indicatif = { workspace = true }
 owo-colors = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 serde_yaml_ng = { workspace = true }
 anyhow = { workspace = true }
 
@@ -26,3 +27,4 @@ anyhow = { workspace = true }
 assert_cmd = { workspace = true }
 testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
+serde_json = { workspace = true }

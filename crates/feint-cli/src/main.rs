@@ -112,6 +112,10 @@ enum Command {
         /// Classification lockfile to check against when --strict is set.
         #[arg(long, default_value = feint_core::classify::DEFAULT_LOCKFILE)]
         lockfile: std::path::PathBuf,
+        /// Print a single JSON summary to stdout instead of the human-readable report, for
+        /// scripts and CI to parse. See DOCS.md's CI section for the shape and exit-code contract.
+        #[arg(long)]
+        json: bool,
     },
     /// Report which columns look sensitive and what they'd be masked as, and check that against
     /// a committed lockfile so schema drift (a new column nobody classified) fails loudly.
@@ -133,6 +137,9 @@ enum Command {
         /// Exit non-zero if the lockfile is missing or the schema has drifted from it. For CI.
         #[arg(long)]
         check: bool,
+        /// Print a single JSON summary to stdout instead of the human-readable report.
+        #[arg(long)]
+        json: bool,
     },
     /// Convert another tool's config to feint.yaml. Best effort — review the report before using the output.
     Migrate {
@@ -243,6 +250,7 @@ async fn main() -> anyhow::Result<()> {
             skip_verify,
             strict,
             lockfile,
+            json,
         } => {
             commands::mask::run(
                 &database_url,
@@ -256,6 +264,7 @@ async fn main() -> anyhow::Result<()> {
                 skip_verify,
                 strict,
                 &lockfile,
+                json,
             )
             .await
         }
@@ -266,8 +275,18 @@ async fn main() -> anyhow::Result<()> {
             lockfile,
             write,
             check,
+            json,
         } => {
-            commands::classify::run(&database_url, &config, &schemas, &lockfile, write, check).await
+            commands::classify::run(
+                &database_url,
+                &config,
+                &schemas,
+                &lockfile,
+                write,
+                check,
+                json,
+            )
+            .await
         }
         Command::Migrate { tool } => match tool {
             MigrateTool::Snaplet {

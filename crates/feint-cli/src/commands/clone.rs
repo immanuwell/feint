@@ -35,7 +35,7 @@ pub async fn run(
     spinner.finish_and_clear();
 
     if strict {
-        classify::check_strict(&schema, &config, lockfile)?;
+        classify::check_strict(&schema, &config, lockfile, false)?;
     }
 
     let plan = graph::plan_insertion(&schema)?;

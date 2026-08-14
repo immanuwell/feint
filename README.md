@@ -6,6 +6,8 @@ A single binary for Postgres test data. Generate synthetic data from nothing, cl
 
 No ORM. No config server. No Docker stack. It reads your schema and writes rows.
 
+No Postgres extension to install, either. feint connects like any client and does everything from there, so it runs unmodified against managed Postgres that won't grant superuser: RDS, Aurora, Cloud SQL, Neon. Extension-based masking tools (PostgreSQL Anonymizer is the well known one) cannot be installed on those at all.
+
 feint understands foreign keys, enums, arrays, JSONB, UUIDs, domains, and cyclic references. It never guesses wrong about your constraints. If a run succeeds, your data is valid.
 
 Every run is deterministic. Same seed, same input, same output, every time. A masked column always maps the same source row to the same fake value, whether you reach that row through `clone` or `mask`, today or next month. See [Deterministic identity](DOCS.md#deterministic-identity).

@@ -91,7 +91,7 @@ On success, `up` prints the total row count, the time taken, and confirms that c
 ### feint clone
 
 ```
-feint clone <SOURCE_URL> <TARGET_URL> [--root "<table> WHERE <condition>"] [--config <PATH>] [--schema <NAME>]...
+feint clone <SOURCE_URL> <TARGET_URL> [--root "<table> WHERE <condition>"] [--config <PATH>] [--schema <NAME>]... [--strict] [--lockfile <PATH>]
 ```
 
 Reads real rows from `SOURCE_URL` and writes them into `TARGET_URL`, masking sensitive columns as configured (see [Masking](#masking)).
@@ -101,6 +101,7 @@ Reads real rows from `SOURCE_URL` and writes them into `TARGET_URL`, masking sen
 - `--root "<table> WHERE <condition>"` clones a subset instead of the whole database. See [Subsetting](#subsetting). Without `--root`, feint clones every table.
 - `--config <PATH>` reads masking overrides from a `feint.yaml` file, if one exists. The `rows:` field in that file is ignored by `clone`, it only matters for `up`.
 - `--schema <NAME>` sets which schema to read from source, same as the other commands.
+- `--strict` / `--lockfile <PATH>`: see [Fail-closed masking](#fail-closed-masking---strict).
 
 Primary keys and foreign keys are preserved exactly as they are on the source. This means:
 
@@ -113,7 +114,7 @@ On success, `clone` prints the row count per table and confirms that keys were p
 ### feint mask
 
 ```
-feint mask <DATABASE_URL> [--config <PATH>] [--schema <NAME>]... [--batch-size N] [--dry-run] [--yes] [--resume] [--max-batches N] [--skip-verify]
+feint mask <DATABASE_URL> [--config <PATH>] [--schema <NAME>]... [--batch-size N] [--dry-run] [--yes] [--resume] [--max-batches N] [--skip-verify] [--strict] [--lockfile <PATH>] [--json]
 ```
 
 Rewrites a single database's own sensitive columns in place. One connection, read and write. No second database, no key remapping, no row inserted or deleted, ever, only `UPDATE` on existing columns.
@@ -128,8 +129,12 @@ This is for a case `clone` does not cover: a database that already has a full, r
 - `--resume` continues a previous run that stopped partway through (crashed, was killed, or hit `--max-batches`), picking up exactly where it left off. Without `--resume`, a run refuses to start at all if it finds unfinished progress from an earlier attempt. You have to choose to continue it, feint will not guess.
 - `--max-batches N` stops the whole run after N batches, leaving a valid, resumable checkpoint. Useful for pacing a very large run across more than one invocation. Unlimited if omitted.
 - `--skip-verify` skips the post-mask verification pass described below. On by default.
+- `--strict` / `--lockfile <PATH>`: see [Fail-closed masking](#fail-closed-masking---strict).
+- `--json` prints one JSON object to stdout instead of the human-readable report, and suppresses every other stdout line (the confirmation prompt, if needed, moves to stderr). See [CI and scripted use](#ci-and-scripted-use) for the shape and the exit-code contract.
 
 `mask` tracks its own progress in a small table it creates on the target, `_feint_mask_checkpoint`, one row per table it has touched. This is what makes `--resume` safe: each batch's `UPDATE` and its checkpoint update commit together, in the same transaction, so a row is read and masked exactly once, ever, no matter how many times a run gets interrupted and resumed. This matters specifically for the `hash` strategy, which is keyed off a column's real value. Re-masking an already-masked row would hash the masked output instead of the original, which is exactly what the checkpoint is there to prevent.
+
+`_feint_mask_checkpoint` is excluded from every command's view of your schema, always, regardless of which schema it actually landed in. It's feint's own bookkeeping, not something `up`, `clone`, `plan`, `policy apply`, or `classify` will ever try to generate into, copy, mask, or track a classification for.
 
 Before and after masking each table, `mask` checks the row count is unchanged. `mask` only ever runs `UPDATE`. A row-count mismatch is a hard error, not a warning, since it would mean something else wrote to the table while masking was running.
 
@@ -184,10 +189,12 @@ Prebuilt masking rules for a data domain, so you don't write every `mask:` overr
 Built-in policies:
 
 - `pii`. Names, contact details, government IDs, dates of birth, addresses.
-- `healthcare`. Medical record numbers, diagnoses, medications, patient identity, policy numbers.
+- `healthcare`. Medical record numbers, diagnoses, medications, patient identity, policy and beneficiary numbers, account numbers, license and certificate numbers, vehicle and device identifiers, URLs, IP addresses, fax numbers.
 - `payments`. Card numbers, CVVs, account and routing numbers, cardholder identity.
 
 A policy is a starting point, not a compliance certification. It matches on column name patterns, the same kind of heuristic [Sensitive field detection](#sensitive-field-detection) uses, so review what it applied before trusting it with real data. Use `--config` on a fresh path first if you want to inspect the result before overwriting an existing file.
+
+`healthcare` targets HIPAA's Safe Harbor identifier list as closely as a column-name policy reasonably can, with one deliberate gap: Safe Harbor requires ages over 89 to be aggregated to "90+", but `age` is too short and too common a substring of ordinary words (storage, message, usage, package, average, ...) to pattern-match safely, so this policy does not include it. Add an explicit `mask: redact` override by hand for a real age column if that identifier class matters to you. See `crates/feint-core/src/policy.rs` for the exact rule list.
 
 Two rules, same as everywhere else in masking:
 
@@ -197,7 +204,7 @@ Two rules, same as everywhere else in masking:
 ### feint classify
 
 ```
-feint classify <DATABASE_URL> [--config <PATH>] [--schema <NAME>]... [--lockfile <PATH>] [--write] [--check]
+feint classify <DATABASE_URL> [--config <PATH>] [--schema <NAME>]... [--lockfile <PATH>] [--write] [--check] [--json]
 ```
 
 Reports which columns look sensitive by name and what strategy they'd resolve to, then compares that against a committed lockfile so a schema change nobody reviewed shows up as a failure instead of silence. See [Fail-closed masking](#fail-closed-masking---strict) for why this exists and how it fits with `mask --strict` and `clone --strict`.
@@ -206,6 +213,7 @@ Reports which columns look sensitive by name and what strategy they'd resolve to
 - `--write` approves the current classification: writes it to the lockfile. Do this after reviewing the report, and commit the file.
 - `--check` exits non-zero if the lockfile is missing, or if the live schema has drifted from it. This is the CI mode.
 - `--lockfile <PATH>` sets where the lockfile lives. Default `feint.lock.yaml`.
+- `--json` prints one JSON object to stdout instead of the human-readable report and diff. See [CI and scripted use](#ci-and-scripted-use).
 
 ## Masking
 
@@ -276,6 +284,63 @@ Two things `--strict` does not do:
 
 - It does not detect PII missed by the [naming heuristic](#sensitive-field-detection) itself. If a column named `notes` happens to hold something sensitive, `--strict` will not flag it, because the heuristic doesn't flag it either. `--strict` guarantees every column's classification was consciously reviewed at least once, not that the review was correct.
 - It does not look inside JSON or JSONB values. See [Known limitations](#known-limitations).
+
+## CI and scripted use
+
+`mask` and `classify` are both meant to run unattended: on a schedule, in a pipeline step, right after a snapshot restore. This section is the contract a script can rely on.
+
+**Exit codes.** 0 means success. Any non-zero exit means something needs attention: a config error, a rejected masking config, an aborted confirmation, a post-mask verification failure, a `--strict` refusal, or a `--check` drift. feint does not currently distinguish failure reasons by exit code number, only by 0 versus non-zero, so a script should treat any non-zero exit as "stop, don't trust this database yet" and read stderr for why.
+
+**Non-interactive runs.** Pass `--yes` to `mask` so it never waits on a confirmation prompt. Without it, `mask` blocks on stdin, which hangs a CI job rather than failing it.
+
+**`--json`.** Both `mask` and `classify` accept `--json`, which prints exactly one JSON object to stdout and nothing else, so a script can pipe it straight into `jq` or a language's JSON parser. Human-readable text (headings, per-table lines, the interactive prompt if `--yes` wasn't passed) either moves to stderr or is suppressed. This holds even when combined with `--strict`: `mask --strict --json` still prints only one JSON object on a successful run.
+
+`classify --json` shape:
+
+```json
+{
+  "lockfile": "feint.lock.yaml",
+  "columns": {"public.users.email": {"sensitive": true, "strategy": "fake"}},
+  "diff": {"new_columns": [], "removed_columns": [], "changed_columns": []},
+  "written": false
+}
+```
+
+`diff` is `null` when there's no lockfile to compare against yet (or right after `--write`, since there's nothing to diff against the file you just wrote).
+
+`mask --json` shape, on a real run:
+
+```json
+{
+  "target": "user@host:5432/dbname",
+  "tables": [{"table": "public.users", "rows": 234}],
+  "total_rows": 234,
+  "verification": {"ok": true, "issues": []}
+}
+```
+
+`mask --dry-run --json` shape:
+
+```json
+{"dry_run": true, "tables": [{"table": "public.users", "rows": 234}], "total_rows": 234}
+```
+
+One honest limitation: `--json` shapes the stdout of a run that completed its masking pass, including one that fails post-mask verification (`verification.ok` is `false`, the issues are listed, and the process still exits non-zero). It does not apply to a hard mid-run error (a dropped connection, a row-count mismatch) or to a `--strict` refusal before any table was touched: those print a human-readable message to stderr and exit non-zero, with no JSON on stdout at all, since there is no completed run to summarize.
+
+**A GitHub Actions example**, gating a staging refresh on a clean classification, then masking and reporting how much got touched:
+
+```yaml
+- name: Check classification hasn't drifted
+  run: feint classify "$STAGING_URL" --check
+
+- name: Mask the restored snapshot
+  run: feint mask "$STAGING_URL" --yes --strict --json > mask-result.json
+
+- name: Record what got masked
+  run: echo "Masked $(jq '.total_rows' mask-result.json) rows" >> "$GITHUB_STEP_SUMMARY"
+```
+
+The first step is a cheap, read-only gate: it fails the job outright if a new column showed up since the lockfile was last approved, before anything is written. `mask --strict` runs the same check again immediately before writing, as a second, independent line of defense, and both a `--strict` refusal and a post-mask verification failure already exit non-zero on their own, no extra step needed to catch either. The third step only runs if the second one succeeded, and exists to make the row count visible in the job's summary rather than buried in a log, using the `--json` output the second step already produced.
 
 ## Deterministic identity
 
@@ -352,6 +417,7 @@ Two things worth knowing before wiring this in:
 
 - **`feint mask` only ever needs one connection string.** It has no awareness of snapshots, cloud APIs, or which instance is "temporary" versus "real". From its side, this is just "mask this one Postgres database." Getting the right connection string to it, and only the right one, is entirely the operator's (or the surrounding script's) responsibility. Treat the target as if it might be a mistake waiting to happen: `--dry-run` first, review what it says it will touch, then a real run.
 - **Check your database's TLS requirements before the first attempt.** Some managed Postgres services require an encrypted connection even when you're already tunneling through SSH, since the requirement is enforced by Postgres itself, not by the transport underneath. Pass `sslmode=require` in the connection string if a plain connection is refused with something like "no pg_hba.conf entry ... no encryption."
+- **No superuser needed, which matters here specifically.** The temporary instance in step 3.5 is exactly the kind of managed Postgres (RDS, Aurora, Cloud SQL, Neon) that will not grant superuser and cannot install an extension. feint doesn't need either: it's a normal client connection that reads and writes rows like any application would. Extension-based masking tools cannot run this step at all on those platforms; feint doesn't notice the difference.
 
 ## The feint.yaml file
 

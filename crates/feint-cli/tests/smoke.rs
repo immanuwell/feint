@@ -8,6 +8,22 @@ use testcontainers::ImageExt;
 use testcontainers_modules::postgres::Postgres;
 use tokio_postgres::NoTls;
 
+/// Parse a command's stdout as exactly one JSON value — the `--json` mode
+/// contract is a single object on stdout, nothing else, so any stray
+/// human-readable line mixed in must fail this parse, not just fail
+/// silently.
+fn parse_single_json_line(output: &[u8]) -> serde_json::Value {
+    let text = String::from_utf8_lossy(output);
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "--json stdout must be exactly one line, got: {text:?}"
+    );
+    serde_json::from_str(lines[0])
+        .unwrap_or_else(|e| panic!("--json stdout was not valid JSON: {e}\nstdout: {text}"))
+}
+
 #[tokio::test]
 async fn init_then_up_smoke_test() {
     let container = Postgres::default()
@@ -260,6 +276,108 @@ async fn classify_strict_fail_closed_smoke_test() {
         "mask --strict should succeed once the drifted column has been consciously re-approved: {}",
         String::from_utf8_lossy(&mask_after_reapproval.stderr)
     );
+
+    let _ = std::fs::remove_file(&config_path);
+    let _ = std::fs::remove_file(&lockfile_path);
+}
+
+/// `--json` on `classify` and `mask` must produce exactly one JSON object
+/// on stdout, parseable and structurally correct, so a CI pipeline can
+/// pipe it straight to `jq` without any human-readable text mixed in.
+#[tokio::test]
+async fn json_output_is_valid_and_parseable_end_to_end() {
+    let container = Postgres::default()
+        .with_tag("16-alpine")
+        .start()
+        .await
+        .expect("start postgres testcontainer (is Docker running?)");
+    let port = container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("mapped port");
+    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+
+    let (client, connection) = tokio_postgres::connect(&url, NoTls).await.expect("connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .batch_execute(
+            "CREATE TABLE users (id serial PRIMARY KEY, email text NOT NULL, status text NOT NULL); \
+             INSERT INTO users (email, status) VALUES ('a@example.com', 'ok'), ('b@example.com', 'ok');",
+        )
+        .await
+        .expect("create smoke-test schema");
+
+    let config_path = std::env::temp_dir().join(format!(
+        "feint_json_smoke_config_{}.yaml",
+        std::process::id()
+    ));
+    let lockfile_path =
+        std::env::temp_dir().join(format!("feint_json_smoke_lock_{}.yaml", std::process::id()));
+    let _ = std::fs::remove_file(&lockfile_path);
+
+    let classify_write = Command::cargo_bin("feint")
+        .unwrap()
+        .args(["classify", &url, "--write", "--json", "--config"])
+        .arg(&config_path)
+        .args(["--lockfile"])
+        .arg(&lockfile_path)
+        .output()
+        .expect("run feint classify --write --json");
+    assert!(classify_write.status.success());
+    let classify_json = parse_single_json_line(&classify_write.stdout);
+    assert_eq!(classify_json["written"], true);
+    assert_eq!(
+        classify_json["columns"]["public.users.email"]["sensitive"],
+        true
+    );
+    assert_eq!(
+        classify_json["columns"]["public.users.email"]["strategy"],
+        "fake"
+    );
+    assert!(classify_json["diff"].is_null());
+
+    let classify_check = Command::cargo_bin("feint")
+        .unwrap()
+        .args(["classify", &url, "--check", "--json", "--config"])
+        .arg(&config_path)
+        .args(["--lockfile"])
+        .arg(&lockfile_path)
+        .output()
+        .expect("run feint classify --check --json");
+    assert!(classify_check.status.success());
+    let check_json = parse_single_json_line(&classify_check.stdout);
+    assert_eq!(check_json["diff"]["new_columns"], serde_json::json!([]));
+
+    let dry_run = Command::cargo_bin("feint")
+        .unwrap()
+        .args(["mask", &url, "--dry-run", "--json", "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("run feint mask --dry-run --json");
+    assert!(dry_run.status.success());
+    let dry_run_json = parse_single_json_line(&dry_run.stdout);
+    assert_eq!(dry_run_json["dry_run"], true);
+    assert_eq!(dry_run_json["total_rows"], 2);
+
+    let mask_run = Command::cargo_bin("feint")
+        .unwrap()
+        .args(["mask", &url, "--yes", "--strict", "--json", "--config"])
+        .arg(&config_path)
+        .args(["--lockfile"])
+        .arg(&lockfile_path)
+        .output()
+        .expect("run feint mask --yes --strict --json");
+    assert!(
+        mask_run.status.success(),
+        "mask --json failed: {}",
+        String::from_utf8_lossy(&mask_run.stderr)
+    );
+    let mask_json = parse_single_json_line(&mask_run.stdout);
+    assert_eq!(mask_json["total_rows"], 2);
+    assert_eq!(mask_json["verification"]["ok"], true);
+    assert_eq!(mask_json["verification"]["issues"], serde_json::json!([]));
 
     let _ = std::fs::remove_file(&config_path);
     let _ = std::fs::remove_file(&lockfile_path);
