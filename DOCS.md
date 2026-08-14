@@ -200,6 +200,35 @@ Two rules are enforced and cannot be overridden:
 
 `mask` has one further requirement `clone` does not: a table with a column to mask must have a primary key. Masking needs a stable, ordered key to batch and checkpoint against. A table with a sensitive-looking column and no primary key is rejected with a clear error rather than skipped silently. Set `mask: none` on that column explicitly if you want to leave it alone.
 
+## Deterministic identity
+
+The same seed applied to the same real row always produces the same fake value. Not just within one run, and not just within one command: the guarantee holds across `clone` and `mask`, and across as many separate runs as you like, as long as the seed, the table, the column, and the row's primary key are the same.
+
+Concretely:
+
+```
+prod.users, id 9281:
+  Alice Thompson, alice@example.com
+
+feint clone $PROD_URL $DEV_URL --config feint.yaml   (seed: team-default)
+  dev.users, id 9281: Maria Stone, maria.stone@example.test
+
+a week later, a fresh snapshot restore + feint mask, same seed:
+  stage.users, id 9281: Maria Stone, maria.stone@example.test
+```
+
+User 9281 gets the same fake identity every time, on every database, because both commands derive the fake value from the same inputs: the seed in `feint.yaml`, the table's schema-qualified name, the column name, and the row's real primary key. Neither command looks at the other's output, and neither needs to. The math just agrees.
+
+This is not a coincidence you have to maintain by hand. It falls out of `clone` and `mask` sharing the same masking code path (see [Masking](#masking) above) and both keying off the row's real, unmasked primary key rather than an insertion order or a row number that could differ between two databases. A test proves this directly: `cargo test --test cross_mode_identity -- --nocapture` clones a database with masking, separately masks an independent copy of the same source data in place, and asserts the two runs produced byte-identical fake values for every row.
+
+What changes the fake identity a row gets:
+
+- A different `seed` in `feint.yaml`, or a different `--seed` passed to a command that accepts one.
+- A different table or column name. Identity is per-column, not per-row: the fake email for user 9281 has nothing to do with the fake name for user 9281 beyond both being derived from the same seed.
+- A different primary key. If a row's real PK changes between two databases (rare, but possible if one was reloaded with new IDs), its fake identity changes too, since the PK is the whole basis of the identity.
+
+What does not change it: which command reached the row, which database it's sitting in, how many other rows are around it, or how much time passed between runs.
+
 ## Subsetting
 
 `--root "<table> WHERE <condition>"` clones only the rows that belong to a starting condition, instead of the whole database.
@@ -388,6 +417,7 @@ The test suite includes:
 - Integration tests for `mask`: batching across many rows, a genuinely interrupted-and-resumed run verified against independently-computed expected output (not just spot-checked), the same unsafe-config rejections as `clone`, and the row-count invariant.
 - A smoke test that runs the actual compiled binary through `init` and `up`.
 - `correctness_demo`, a single narrated run over every nasty-schema fixture in order, printing a clean pass/fail report. Run it yourself with `cargo test --test correctness_demo -- --nocapture`. This is the source of the transcript in the README.
+- `cross_mode_identity`, which clones a database with masking and separately masks an independent copy of the same source data in place, then asserts both runs produced byte-identical fake values for every row. This is what backs the claim in [Deterministic identity](#deterministic-identity).
 
 ## Roadmap
 
