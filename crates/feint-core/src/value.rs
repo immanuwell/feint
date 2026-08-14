@@ -14,6 +14,7 @@ use std::error::Error as StdError;
 
 use bytes::BytesMut;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use fallible_iterator::FallibleIterator;
 use postgres_types::{FromSql, IsNull, Kind, ToSql, Type};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -229,6 +230,26 @@ impl<'a> FromSql<'a> for PgValue {
                     ty.name().to_string(),
                     String::from_utf8_lossy(raw).into_owned(),
                 ),
+                // The binary array wire format is a structured header
+                // (dimension count, bounds, element OID) followed by
+                // length-prefixed per-element payloads — not text at all.
+                // Reading it as UTF-8 (the fallback below) silently
+                // corrupts it; some of those header/length bytes are
+                // arbitrary binary, including literal NUL, which Postgres
+                // then refuses on the way back in. `array_from_sql` is the
+                // same decoder `postgres-types`' own `Vec<T>` impl uses.
+                Kind::Array(ref member_type) => {
+                    let array = postgres_protocol::types::array_from_sql(raw)?;
+                    if array.dimensions().count()? > 1 {
+                        return Err("multi-dimensional arrays are not supported".into());
+                    }
+                    let mut values = Vec::new();
+                    let mut iter = array.values();
+                    while let Some(elem) = iter.next()? {
+                        values.push(PgValue::from_sql_nullable(member_type, elem)?);
+                    }
+                    PgValue::Array(values)
+                }
                 // Best-effort fallback for domains/citext/other types whose
                 // wire format happens to be UTF-8 text (true for citext and
                 // text-based domains; NOT byte-correct for inet/cidr/range

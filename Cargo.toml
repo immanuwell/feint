@@ -43,3 +43,4 @@ assert_cmd = "2"
 dtor = "1"
 bincode = "1"
 flate2 = "1"
+futures-util = { version = "0.3", features = ["sink"] }
