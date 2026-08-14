@@ -22,12 +22,12 @@ use crate::config::FeintConfig;
 use crate::error::Result;
 use crate::generate::classify_sensitive;
 use crate::introspect::Schema;
-use crate::mask::{is_key_column, resolve_mask_strategy, MaskStrategy};
+use crate::mask::{is_key_column, resolve_mask_strategy, JsonPathRules, MaskStrategy};
 
 pub const DEFAULT_LOCKFILE: &str = "feint.lock.yaml";
 const LOCK_VERSION: u32 = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ColumnClassification {
     /// True if the column name matches feint's sensitive-name heuristic
     /// ([`classify_sensitive`]), regardless of what strategy it resolved to
@@ -35,6 +35,11 @@ pub struct ColumnClassification {
     /// the case this module exists to surface.
     pub sensitive: bool,
     pub strategy: MaskStrategy,
+    /// Configured `json_paths:` rules, if any. A column with rules here
+    /// and `strategy: none` is not unmasked — it's masked per-path
+    /// instead. See [`crate::mask::mask_json_column_value`].
+    #[serde(default, skip_serializing_if = "JsonPathRules::is_empty")]
+    pub json_paths: JsonPathRules,
 }
 
 /// Every non-key, writable column in the schema, keyed `schema.table.column`.
@@ -62,12 +67,17 @@ pub fn classify_schema(schema: &Schema, config: &FeintConfig) -> ClassificationR
             let override_strategy = overrides.get(&column.name).and_then(|c| c.mask);
             let strategy = resolve_mask_strategy(table, column, override_strategy);
             let sensitive = classify_sensitive(&column.name).is_some();
+            let json_paths = overrides
+                .get(&column.name)
+                .map(|c| c.json_paths.clone())
+                .unwrap_or_default();
             let key = format!("{}.{}", table.id.qualified(), column.name);
             columns.insert(
                 key,
                 ColumnClassification {
                     sensitive,
                     strategy,
+                    json_paths,
                 },
             );
         }
@@ -79,6 +89,8 @@ pub fn classify_schema(schema: &Schema, config: &FeintConfig) -> ClassificationR
 struct LockedColumn {
     sensitive: bool,
     strategy: MaskStrategy,
+    #[serde(default, skip_serializing_if = "JsonPathRules::is_empty")]
+    json_paths: JsonPathRules,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -100,6 +112,7 @@ impl ClassificationLock {
                         LockedColumn {
                             sensitive: v.sensitive,
                             strategy: v.strategy,
+                            json_paths: v.json_paths.clone(),
                         },
                     )
                 })
@@ -182,14 +195,18 @@ pub fn diff_against_lock(
                 strategy: current.strategy,
             }),
             Some(locked) => {
-                if locked.sensitive != current.sensitive || locked.strategy != current.strategy {
+                if locked.sensitive != current.sensitive
+                    || locked.strategy != current.strategy
+                    || locked.json_paths != current.json_paths
+                {
                     diff.changed_columns.push(ChangedEntry {
                         column: column.clone(),
                         old: ColumnClassification {
                             sensitive: locked.sensitive,
                             strategy: locked.strategy,
+                            json_paths: locked.json_paths.clone(),
                         },
-                        new: *current,
+                        new: current.clone(),
                     });
                 }
             }
@@ -325,6 +342,7 @@ mod tests {
                         crate::config::ColumnConfig {
                             generator: None,
                             mask: Some(MaskStrategy::Hash),
+                            json_paths: Default::default(),
                         },
                     )]),
                 },
@@ -344,6 +362,7 @@ mod tests {
                     crate::config::ColumnConfig {
                         generator: None,
                         mask: Some(MaskStrategy::None),
+                        json_paths: Default::default(),
                     },
                 )]),
             },

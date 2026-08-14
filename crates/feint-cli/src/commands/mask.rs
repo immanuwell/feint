@@ -116,7 +116,13 @@ pub async fn run(
             let cols = t
                 .columns
                 .iter()
-                .map(|c| format!("{} ({})", c.name, strategy_label(c.strategy)))
+                .map(|c| {
+                    if c.json_paths.is_empty() {
+                        format!("{} ({})", c.name, strategy_label(c.strategy))
+                    } else {
+                        format!("{} ({} json path rule(s))", c.name, c.json_paths.len())
+                    }
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
             println!("  {}: {cols}", t.table.qualified());

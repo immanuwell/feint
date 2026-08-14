@@ -242,6 +242,7 @@ pub fn apply_policy(
                 ColumnConfig {
                     generator: rule.generator.map(str::to_string),
                     mask: Some(rule.strategy),
+                    json_paths: Default::default(),
                 },
             );
             report
@@ -384,6 +385,7 @@ mod tests {
                     ColumnConfig {
                         generator: None,
                         mask: Some(MaskStrategy::None),
+                        json_paths: Default::default(),
                     },
                 )]),
             },

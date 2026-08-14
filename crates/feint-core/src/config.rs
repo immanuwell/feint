@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::introspect::Schema;
-use crate::mask::MaskStrategy;
+use crate::mask::{JsonPathRules, MaskStrategy};
 
 pub const DEFAULT_SEED: &str = "default";
 pub const DEFAULT_ROWS: u32 = 100;
@@ -19,6 +19,13 @@ pub struct ColumnConfig {
     /// CLONE-mode masking strategy override. See [`crate::mask`].
     #[serde(default)]
     pub mask: Option<MaskStrategy>,
+    /// Per-path masking rules for a `json`/`jsonb` column: mask specific
+    /// keys inside the value instead of the whole column. Mutually
+    /// exclusive with `mask` (other than `mask: none`, the default) — see
+    /// [`crate::mask::validate_masking_config`]. Only meaningful for
+    /// `clone`/`mask`; GENERATE mode never reads it.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub json_paths: JsonPathRules,
 }
 
 /// Per-table behavior for `clone`'s hybrid mode: clone this table's real

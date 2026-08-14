@@ -26,6 +26,13 @@ pub struct VerificationFinding {
 /// Check every masked column in `plan` against the database's current
 /// state. Returns one finding per column that looks wrong; an empty
 /// vector means everything checked out.
+///
+/// A column masked via `json_paths` (see [`crate::mask::mask_json_column_value`])
+/// is not checked here: its plan-level `strategy` is `none` (masking
+/// happens per path, not for the whole column), so it's skipped like any
+/// other unmasked column. Verifying arbitrary JSON paths would need to
+/// walk each configured path's shape per row, which this pass doesn't do
+/// yet.
 pub async fn verify_masking(
     client: &Client,
     schema: &Schema,

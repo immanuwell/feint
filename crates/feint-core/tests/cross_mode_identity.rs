@@ -34,6 +34,7 @@ fn mask_config(table: &str) -> FeintConfig {
         ColumnConfig {
             generator: None,
             mask: Some(MaskStrategy::Fake),
+            json_paths: Default::default(),
         },
     );
     cols.insert(
@@ -41,6 +42,7 @@ fn mask_config(table: &str) -> FeintConfig {
         ColumnConfig {
             generator: None,
             mask: Some(MaskStrategy::Fake),
+            json_paths: Default::default(),
         },
     );
     let mut tables = BTreeMap::new();

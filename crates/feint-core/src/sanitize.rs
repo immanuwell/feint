@@ -23,7 +23,7 @@ use crate::config::FeintConfig;
 use crate::error::{FeintError, Result};
 use crate::insert::sql_cast_type;
 use crate::introspect::{Schema, Table, TableId, MASK_CHECKPOINT_TABLE as CHECKPOINT_TABLE};
-use crate::mask::{self, validate_masking_config, MaskStrategy};
+use crate::mask::{self, validate_masking_config, JsonPathRules, MaskStrategy};
 use crate::value::PgValue;
 
 const MAX_BIND_PARAMS: usize = 60_000;
@@ -32,6 +32,11 @@ const MAX_BIND_PARAMS: usize = 60_000;
 pub struct ColumnMaskPlan {
     pub name: String,
     pub strategy: MaskStrategy,
+    /// Non-empty only for a `json`/`jsonb` column with `json_paths:`
+    /// configured. When non-empty, `strategy` is not applied to this
+    /// column at all — masking happens per path via
+    /// [`crate::mask::mask_json_column_value`] instead.
+    pub json_paths: JsonPathRules,
 }
 
 #[derive(Debug, Clone)]
@@ -70,12 +75,17 @@ pub fn plan_sanitization(schema: &Schema, config: &FeintConfig) -> Result<Saniti
             }
             let override_strategy = overrides.get(&column.name).and_then(|c| c.mask);
             let strategy = mask::resolve_mask_strategy(table, column, override_strategy);
-            if strategy == MaskStrategy::None {
+            let json_paths = overrides
+                .get(&column.name)
+                .map(|c| c.json_paths.clone())
+                .unwrap_or_default();
+            if strategy == MaskStrategy::None && json_paths.is_empty() {
                 continue;
             }
             columns.push(ColumnMaskPlan {
                 name: column.name.clone(),
                 strategy,
+                json_paths,
             });
         }
 
@@ -376,18 +386,29 @@ async fn apply_batch(
         for (i, col_plan) in table_plan.columns.iter().enumerate() {
             let real_value = &row[pk_count + i];
             let column = table.column(&col_plan.name).expect("column exists");
-            let generator_override = overrides
-                .get(&col_plan.name)
-                .and_then(|c| c.generator.as_deref());
-            let masked = mask::mask_value(
-                col_plan.strategy,
-                column,
-                generator_override,
-                real_value,
-                &config.seed,
-                &table_name,
-                &row_identity,
-            )?;
+            let masked = if !col_plan.json_paths.is_empty() {
+                mask::mask_json_column_value(
+                    &col_plan.json_paths,
+                    real_value,
+                    &config.seed,
+                    &table_name,
+                    &col_plan.name,
+                    &row_identity,
+                )
+            } else {
+                let generator_override = overrides
+                    .get(&col_plan.name)
+                    .and_then(|c| c.generator.as_deref());
+                mask::mask_value(
+                    col_plan.strategy,
+                    column,
+                    generator_override,
+                    real_value,
+                    &config.seed,
+                    &table_name,
+                    &row_identity,
+                )?
+            };
             out_row.push(masked);
         }
         masked_rows.push(out_row);

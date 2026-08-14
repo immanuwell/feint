@@ -302,6 +302,42 @@ Two rules are enforced and cannot be overridden:
 
 `mask` has one further requirement `clone` does not: a table with a column to mask must have a primary key. Masking needs a stable, ordered key to batch and checkpoint against. A table with a sensitive-looking column and no primary key is rejected with a clear error rather than skipped silently. Set `mask: none` on that column explicitly if you want to leave it alone.
 
+## JSON path masking
+
+The strategies above treat a `json`/`jsonb` column as one opaque value: `mask: fake` replaces the whole thing, `mask: hash` and `mask: redact` do too, and `mask: none` leaves it alone. That is often too blunt. A `profile` column holding `{"bio": "...", "contact": {"email": "...", "phone": "..."}}` usually needs its `contact.email` masked while `bio` stays intact and readable, not the whole blob wiped.
+
+`json_paths` masks specific keys inside the value and leaves everything else, including the rest of the object's shape, untouched:
+
+```yaml
+version: 1
+seed: default
+tables:
+  public.users:
+    rows: 0
+    columns:
+      profile:
+        json_paths:
+          contact.email: fake
+          contact.ssn: redact
+```
+
+A path is a dot-separated chain of object keys (`contact.email` means `value["contact"]["email"]`). Each path gets its own strategy from the same four (`fake`, `hash`, `redact`, `none`), applied only to that leaf:
+
+- `redact` replaces the leaf with `null`, any JSON type.
+- `hash` replaces a leaf with a deterministic `masked_<hex>` string, same as column-level `hash`.
+- `fake` replaces a leaf with a synthetic value that keeps its JSON type: a string leaf gets fake text (using the same key-name heuristic as [Sensitive field detection](#sensitive-field-detection) on the leaf's own key, so an `email` key gets an email-shaped fake value), a number leaf gets a random number, a boolean leaf gets a random boolean. A leaf that's itself an object or array has no well-defined "fake" replacement, so `fake` redacts it to `null` instead of guessing a shape.
+- `none` is a no-op, useful only to document that a path was looked at and is fine as-is.
+
+A row whose document doesn't have a configured path (a sparse/optional key, or a document that isn't even an object at that point) is left alone for that row, not treated as an error: not every row's JSON necessarily has the same shape.
+
+`json_paths` and a whole-column `mask:` (other than the default `mask: none`) are mutually exclusive on the same column: set one or the other, not both, since it's ambiguous what "mask the whole column AND mask this one path inside it" should mean. `json_paths` is also rejected on any column that isn't `json`/`jsonb`, and on a primary-key or foreign-key column, same as a whole-column `mask:` override.
+
+Scope, on purpose:
+
+- Only object keys are addressed. A path through an array (`items.0.name`) isn't supported: array elements have no stable "key" to mask consistently across rows with differently-sized arrays.
+- `feint init`'s sensitive-field banner samples up to 200 real, non-null rows per JSON/JSONB column and looks at their key names (never the values) up to 2 levels of nesting, flagging any key that matches the same name heuristic used for plain columns. This is a name-based hint to help you write `json_paths:` entries, not an automatic config: nothing gets written for you.
+- The post-mask verification pass (on by default after `mask`) does not check `json_paths` rules; it verifies whole-column strategies only. A `json_paths`-masked column is treated like any other unmasked column for verification purposes.
+
 ## Hybrid clone (mask + generate in one run)
 
 A table-level `strategy:` key in `feint.yaml` lets one `clone` run mask real rows for the tables that matter and generate synthetic padding for the rest, in the same run, with foreign keys holding correctly across the boundary:
@@ -635,7 +671,7 @@ Scope, on purpose:
 
 feint looks at your column names and flags ones that look like they hold personal data: emails, phone numbers, names, dates of birth, addresses, IP addresses, card numbers, SSNs, and similar identifiers.
 
-`feint init` shows this as a banner, purely informational, since `up` generates everything synthetically anyway. `feint clone` uses the same detection to decide which columns get masked by default, see [Masking](#masking).
+`feint init` shows this as a banner, purely informational, since `up` generates everything synthetically anyway. `feint clone` uses the same detection to decide which columns get masked by default, see [Masking](#masking). `feint init` also samples real JSON/JSONB values for key names that match the same heuristic, see [JSON path masking](#json-path-masking).
 
 This detection is based on column name patterns only. It does not know what the table is about. A column named `name` on a `users` table and a column named `name` on an `organizations` table are treated the same way right now, which is not always correct. Use an explicit `generator:` (for `up`) or `mask:` (for `clone`) override in `feint.yaml` if a guess is wrong.
 
@@ -649,7 +685,7 @@ This detection is based on column name patterns only. It does not know what the 
 - There is no way to avoid duplicate data on a second `up` or `clone` run against the same tables. Truncate the target first if you want a clean set.
 - `clone` does not create tables on the target. The target schema must already exist and match the source.
 - `--root` subsetting only follows actual foreign key relationships. A table your application looks up outside of any foreign key is not discovered and stays empty on the target.
-- JSON and JSONB columns are masked or left alone as a whole column. feint does not look inside a JSON value for PII in a nested field.
+- `json_paths` (see [JSON path masking](#json-path-masking)) only addresses object keys, not array elements, and its `fake` strategy falls back to `redact` for a leaf that's itself an object or array rather than guessing a shape. Post-mask verification also does not check `json_paths` rules, only whole-column strategies.
 - `mask` requires a primary key on any table it needs to touch (see [Masking](#masking)).
 - `--strict` (see [Fail-closed masking](#fail-closed-masking---strict)) guarantees every column's classification was reviewed at least once, not that the naming heuristic behind that classification is correct. It will not catch PII in a column the heuristic itself misses.
 - `migrate` cannot convert arbitrary custom code (Snaplet's `seed.ts` generator functions, Neosync's JavaScript/user-defined transformers). These are reported as needing manual review, not guessed at.
@@ -686,6 +722,7 @@ The test suite includes:
 - `snapshot_restore`, which proves the whole point of the split: a snapshot captured from a source container round-trips through a real file on disk, and `restore` never touches the source connection again after `capture` returns (the smoke test goes further and destroys the source container entirely between `snapshot` and `restore`). Also covers a foreign-key cycle surviving the round trip, `strategy: generate` rejected at capture time, `--root` composing with a snapshot, and a schema that drifted between capture and restore being rejected rather than guessed at.
 - `copy_volume`, which round-trips 20,000 rows through `clone`, `up` (an unreferenced leaf table), and `restore`, checking a full-column checksum and a specific sampled row rather than just a count, plus a dedicated test that writes a real array column containing tabs, newlines, backslashes, and non-ASCII text through `clone`'s `COPY` path and reads the exact values back from Postgres. That second test is what caught a real, pre-existing bug: `PgValue`'s `FromSql` had no explicit handling for the binary array wire format and was silently corrupting any array column read back when the driver requested binary rather than text, now fixed (see [Supported Postgres features](#supported-postgres-features)).
 - `profile_mode`, which captures a deliberately skewed distribution (one parent with 50 children among 19 with exactly 1 each) from a real database and confirms `up --profile` reproduces that exact shape (never a count the source distribution didn't actually have), a captured null rate landing within a statistical tolerance band at n=500, the profile's row count winning as the default for an unconfigured table but losing to an explicit `rows:`, and the same profile-driven run producing an identical total both times it's run.
+- `json_path_masking`, which confirms `json_paths` masks only the configured leaf through both `mask` and `clone` against real Postgres JSONB columns (a sibling key and an untouched row both survive unchanged, a row missing the whole nested object doesn't error), a `hash`-masked path resolving to the expected placeholder format, and both `json_paths` config rejections (combined with a whole-column `mask:`, or set on a non-JSON column) firing before any table is read or written. The smoke test separately proves `feint init`'s JSONB key-name sampling against a real container: a nested sensitive-looking key gets flagged with its full path, and a plain key does not.
 
 ## Roadmap
 

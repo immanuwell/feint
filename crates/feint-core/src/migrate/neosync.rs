@@ -106,6 +106,7 @@ pub fn migrate_neosync(job_json: &str) -> Result<NeosyncMigration, serde_json::E
                     ColumnConfig {
                         generator: generator.map(str::to_string),
                         mask: Some(mask),
+                        json_paths: Default::default(),
                     },
                 );
                 report.converted.push(ConvertedColumn {
@@ -125,6 +126,7 @@ pub fn migrate_neosync(job_json: &str) -> Result<NeosyncMigration, serde_json::E
                     ColumnConfig {
                         generator: generator.map(str::to_string),
                         mask: Some(mask),
+                        json_paths: Default::default(),
                     },
                 );
                 report.converted.push(ConvertedColumn {

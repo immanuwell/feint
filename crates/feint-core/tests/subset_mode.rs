@@ -24,6 +24,7 @@ fn config_with_unmasked_name(table: &str) -> FeintConfig {
         ColumnConfig {
             generator: None,
             mask: Some(MaskStrategy::None),
+            json_paths: Default::default(),
         },
     );
     let mut tables = BTreeMap::new();

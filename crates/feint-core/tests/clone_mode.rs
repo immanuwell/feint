@@ -22,6 +22,7 @@ fn config_with(table: &str, columns: Vec<(&str, MaskStrategy)>) -> FeintConfig {
             ColumnConfig {
                 generator: None,
                 mask: Some(strategy),
+                json_paths: Default::default(),
             },
         );
     }

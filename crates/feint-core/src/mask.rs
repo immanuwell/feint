@@ -5,13 +5,21 @@
 //! invariant is what lets CLONE mode preserve keys unchanged on the
 //! target and skip the `RefPool`/remapping machinery GENERATE mode needs.
 
+use std::collections::BTreeMap;
+
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::config::FeintConfig;
 use crate::error::{FeintError, Result};
-use crate::generate::{classify_sensitive, derive_rng, generate_value, SeedKey};
+use crate::generate::{classify_sensitive, derive_rng, fake_text_for_key, generate_value, SeedKey};
 use crate::introspect::{Column, Schema, Table, TypeKind};
 use crate::value::PgValue;
+
+/// Dot-separated JSON key path (e.g. `"contact.email"`) to the masking
+/// strategy to apply at that path inside a `json`/`jsonb` column's value.
+/// See [`mask_json_column_value`].
+pub type JsonPathRules = BTreeMap<String, MaskStrategy>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -82,15 +90,53 @@ pub fn validate_masking_config(schema: &Schema, config: &FeintConfig) -> Result<
             continue;
         };
         for (col_name, col_config) in &table_config.columns {
+            let Some(column) = table.column(col_name) else {
+                continue;
+            };
+
+            if !col_config.json_paths.is_empty() {
+                if is_key_column(table, col_name) {
+                    return Err(FeintError::Config(format!(
+                        "`{}`.`{col_name}` cannot use `json_paths`: it is part of a primary key \
+                         or foreign key, and masking it would break referential integrity.",
+                        table.id.qualified()
+                    )));
+                }
+                if !matches!(column.type_name.as_str(), "json" | "jsonb") {
+                    return Err(FeintError::Config(format!(
+                        "`{}`.`{col_name}` cannot use `json_paths`: it is a `{}` column, not \
+                         `json`/`jsonb`.",
+                        table.id.qualified(),
+                        column.type_name
+                    )));
+                }
+                if col_config.mask.is_some_and(|s| s != MaskStrategy::None) {
+                    return Err(FeintError::Config(format!(
+                        "`{}`.`{col_name}` sets both `mask:` and `json_paths:` — pick one. \
+                         `json_paths` masks specific keys inside the JSON value and leaves the \
+                         rest alone; a whole-column `mask:` masks the entire value. Remove the \
+                         `mask:` override, or drop `json_paths` and mask the whole column instead.",
+                        table.id.qualified()
+                    )));
+                }
+                for path in col_config.json_paths.keys() {
+                    if path.trim().is_empty() || path.split('.').any(|p| p.is_empty()) {
+                        return Err(FeintError::Config(format!(
+                            "`{}`.`{col_name}` has an invalid `json_paths` key {path:?}: must be \
+                             a non-empty, dot-separated path with no empty segments, e.g. \
+                             `contact.email`.",
+                            table.id.qualified()
+                        )));
+                    }
+                }
+            }
+
             let Some(strategy) = col_config.mask else {
                 continue;
             };
             if strategy == MaskStrategy::None {
                 continue;
             }
-            let Some(column) = table.column(col_name) else {
-                continue;
-            };
 
             if is_key_column(table, col_name) {
                 return Err(FeintError::Config(format!(
@@ -177,6 +223,136 @@ pub fn mask_value(
                 Ok(PgValue::Null)
             } else {
                 Ok(redact_literal(column))
+            }
+        }
+    }
+}
+
+/// Apply per-path masking to a `json`/`jsonb` column's real value: every
+/// key listed in `json_paths` gets masked in place, and every key not
+/// listed passes through unchanged. Complements [`mask_value`], which only
+/// ever treats a JSON column as one opaque blob — call this instead when
+/// `json_paths` overrides are configured for the column (validated
+/// mutually exclusive with a whole-column `mask:` by
+/// [`validate_masking_config`]).
+///
+/// A NULL column value, or a path that doesn't exist in a given row's
+/// document (a sparse/optional key, or a document that isn't even an
+/// object), is left as-is for that row rather than treated as an error —
+/// not every row's JSON necessarily has the same shape.
+pub fn mask_json_column_value(
+    json_paths: &JsonPathRules,
+    real_value: &PgValue,
+    seed: &str,
+    table_name: &str,
+    column_name: &str,
+    row_identity: &str,
+) -> PgValue {
+    let PgValue::Json(value) = real_value else {
+        return real_value.clone();
+    };
+    let mut out = value.clone();
+    for (path, strategy) in json_paths {
+        if *strategy == MaskStrategy::None {
+            continue;
+        }
+        let components: Vec<&str> = path.split('.').collect();
+        mask_json_path(
+            &mut out,
+            &components,
+            *strategy,
+            seed,
+            table_name,
+            column_name,
+            row_identity,
+            path,
+        );
+    }
+    PgValue::Json(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mask_json_path(
+    node: &mut serde_json::Value,
+    remaining: &[&str],
+    strategy: MaskStrategy,
+    seed: &str,
+    table_name: &str,
+    column_name: &str,
+    row_identity: &str,
+    full_path: &str,
+) {
+    let [head, tail @ ..] = remaining else {
+        return;
+    };
+    let serde_json::Value::Object(map) = node else {
+        return;
+    };
+    if tail.is_empty() {
+        if let Some(leaf) = map.get_mut(*head) {
+            *leaf = masked_json_leaf(
+                leaf,
+                strategy,
+                seed,
+                table_name,
+                column_name,
+                row_identity,
+                full_path,
+            );
+        }
+    } else if let Some(child) = map.get_mut(*head) {
+        mask_json_path(
+            child,
+            tail,
+            strategy,
+            seed,
+            table_name,
+            column_name,
+            row_identity,
+            full_path,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn masked_json_leaf(
+    original: &serde_json::Value,
+    strategy: MaskStrategy,
+    seed: &str,
+    table_name: &str,
+    column_name: &str,
+    row_identity: &str,
+    full_path: &str,
+) -> serde_json::Value {
+    match strategy {
+        MaskStrategy::None => original.clone(),
+        MaskStrategy::Redact => serde_json::Value::Null,
+        MaskStrategy::Hash => {
+            let input = format!("{seed}\0{table_name}\0{column_name}\0{full_path}\0{original}");
+            let digest = blake3::hash(input.as_bytes());
+            serde_json::Value::String(format!("masked_{}", &digest.to_hex()[..24]))
+        }
+        MaskStrategy::Fake => {
+            let mut rng = derive_rng(
+                seed,
+                &SeedKey {
+                    table: table_name,
+                    column: &format!("{column_name}.{full_path}"),
+                    row_identity,
+                },
+            );
+            match original {
+                serde_json::Value::String(_) => {
+                    let key_name = full_path.rsplit('.').next().unwrap_or(full_path);
+                    serde_json::Value::String(fake_text_for_key(key_name, &mut rng))
+                }
+                serde_json::Value::Number(_) => {
+                    serde_json::json!(rng.gen_range(0..1_000_000i64))
+                }
+                serde_json::Value::Bool(_) => serde_json::Value::Bool(rng.gen_bool(0.5)),
+                // A nested object/array has no single well-defined "fake"
+                // replacement — redact it instead of guessing a shape.
+                _ => serde_json::Value::Null,
             }
         }
     }
@@ -403,5 +579,154 @@ mod tests {
             resolve_mask_strategy(&t2, &pk_col, None),
             MaskStrategy::None
         );
+    }
+
+    fn json_column() -> Column {
+        Column {
+            name: "profile".to_string(),
+            position: 1,
+            type_name: "jsonb".to_string(),
+            type_kind: TypeKind::Scalar,
+            nullable: true,
+            identity: Identity::None,
+            is_stored_generated: false,
+            has_default: false,
+            is_serial_default: false,
+        }
+    }
+
+    #[test]
+    fn json_path_masking_only_touches_configured_paths() {
+        let real = PgValue::Json(serde_json::json!({
+            "bio": "loves hiking",
+            "contact": { "email": "alice@example.com", "phone": "555-1234" }
+        }));
+        let mut paths = JsonPathRules::new();
+        paths.insert("contact.email".to_string(), MaskStrategy::Redact);
+
+        let masked = mask_json_column_value(&paths, &real, "seed", "users", "profile", "1");
+        let PgValue::Json(v) = masked else {
+            panic!("expected Json");
+        };
+        assert_eq!(v["bio"], serde_json::json!("loves hiking"));
+        assert_eq!(v["contact"]["phone"], serde_json::json!("555-1234"));
+        assert_eq!(v["contact"]["email"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn json_path_masking_ignores_a_missing_path() {
+        let real = PgValue::Json(serde_json::json!({ "bio": "hello" }));
+        let mut paths = JsonPathRules::new();
+        paths.insert("contact.email".to_string(), MaskStrategy::Redact);
+
+        let masked = mask_json_column_value(&paths, &real, "seed", "users", "profile", "1");
+        let PgValue::Json(v) = masked else {
+            panic!("expected Json");
+        };
+        assert_eq!(v, serde_json::json!({ "bio": "hello" }));
+    }
+
+    #[test]
+    fn json_path_masking_null_column_passes_through() {
+        let paths = JsonPathRules::from([("a.b".to_string(), MaskStrategy::Redact)]);
+        let masked = mask_json_column_value(&paths, &PgValue::Null, "seed", "t", "c", "1");
+        assert_eq!(masked, PgValue::Null);
+    }
+
+    #[test]
+    fn json_path_hash_is_deterministic_and_differs_from_the_real_value() {
+        let real = PgValue::Json(serde_json::json!({ "ssn": "123-45-6789" }));
+        let paths = JsonPathRules::from([("ssn".to_string(), MaskStrategy::Hash)]);
+        let a = mask_json_column_value(&paths, &real, "seed", "t", "c", "1");
+        let b = mask_json_column_value(&paths, &real, "seed", "t", "c", "1");
+        assert_eq!(a, b);
+        let PgValue::Json(v) = &a else {
+            panic!("expected Json");
+        };
+        assert_ne!(v["ssn"], serde_json::json!("123-45-6789"));
+        assert!(v["ssn"].as_str().unwrap().starts_with("masked_"));
+    }
+
+    #[test]
+    fn json_path_fake_preserves_leaf_type_and_varies_by_row_identity() {
+        let real = PgValue::Json(serde_json::json!({ "age": 30, "active": true }));
+        let paths = JsonPathRules::from([
+            ("age".to_string(), MaskStrategy::Fake),
+            ("active".to_string(), MaskStrategy::Fake),
+        ]);
+        let PgValue::Json(v) = mask_json_column_value(&paths, &real, "seed", "t", "c", "1") else {
+            panic!("expected Json");
+        };
+        assert!(v["age"].is_number());
+        assert!(v["active"].is_boolean());
+    }
+
+    #[test]
+    fn json_path_none_leaves_the_leaf_unchanged() {
+        let real = PgValue::Json(serde_json::json!({ "note": "keep me" }));
+        let paths = JsonPathRules::from([("note".to_string(), MaskStrategy::None)]);
+        let masked = mask_json_column_value(&paths, &real, "seed", "t", "c", "1");
+        assert_eq!(masked, real);
+    }
+
+    #[test]
+    fn json_paths_and_whole_column_mask_are_mutually_exclusive() {
+        let schema = Schema {
+            tables: vec![table_with(vec![json_column()], None, vec![])],
+        };
+        let mut config = FeintConfig {
+            version: 1,
+            seed: "seed".to_string(),
+            tables: BTreeMap::new(),
+        };
+        config.tables.insert(
+            "public.t".to_string(),
+            crate::config::TableConfig {
+                rows: 1,
+                strategy: Default::default(),
+                columns: BTreeMap::from([(
+                    "profile".to_string(),
+                    crate::config::ColumnConfig {
+                        generator: None,
+                        mask: Some(MaskStrategy::Hash),
+                        json_paths: JsonPathRules::from([(
+                            "contact.email".to_string(),
+                            MaskStrategy::Redact,
+                        )]),
+                    },
+                )]),
+            },
+        );
+        let err = validate_masking_config(&schema, &config).unwrap_err();
+        assert!(format!("{err}").contains("both `mask:` and `json_paths:`"));
+    }
+
+    #[test]
+    fn json_paths_rejected_on_a_non_json_column() {
+        let schema = Schema {
+            tables: vec![table_with(vec![text_column("bio", true)], None, vec![])],
+        };
+        let mut config = FeintConfig {
+            version: 1,
+            seed: "seed".to_string(),
+            tables: BTreeMap::new(),
+        };
+        config.tables.insert(
+            "public.t".to_string(),
+            crate::config::TableConfig {
+                rows: 1,
+                strategy: Default::default(),
+                columns: BTreeMap::from([(
+                    "bio".to_string(),
+                    crate::config::ColumnConfig {
+                        generator: None,
+                        mask: None,
+                        json_paths: JsonPathRules::from([("a".to_string(), MaskStrategy::Redact)]),
+                    },
+                )]),
+            },
+        );
+        let err = validate_masking_config(&schema, &config).unwrap_err();
+        assert!(format!("{err}").contains("not `json`/`jsonb`"));
     }
 }

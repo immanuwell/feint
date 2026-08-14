@@ -140,8 +140,13 @@ fn print_report(report: &ClassificationReport) {
     ));
     for (column, entry) in &report.columns {
         let flag = if entry.sensitive { "sensitive" } else { "" };
+        let paths = if entry.json_paths.is_empty() {
+            String::new()
+        } else {
+            format!(", {} json path rule(s)", entry.json_paths.len())
+        };
         println!(
-            "  {:<48} {:<10} {}",
+            "  {:<48} {:<10} {}{paths}",
             column,
             flag,
             strategy_label(entry.strategy)
@@ -169,12 +174,21 @@ fn print_diff(diff: &ClassificationDiff, lockfile: &Path) {
         );
     }
     for c in &diff.changed_columns {
-        println!(
-            "  ~ {:<48} {} -> {}",
-            c.column,
-            strategy_label(c.old.strategy),
-            strategy_label(c.new.strategy)
-        );
+        if c.old.strategy != c.new.strategy {
+            println!(
+                "  ~ {:<48} {} -> {}",
+                c.column,
+                strategy_label(c.old.strategy),
+                strategy_label(c.new.strategy)
+            );
+        } else {
+            println!(
+                "  ~ {:<48} json_paths changed ({} -> {} rule(s))",
+                c.column,
+                c.old.json_paths.len(),
+                c.new.json_paths.len()
+            );
+        }
     }
     for column in &diff.removed_columns {
         println!("  - {column:<48} removed (column no longer exists)");

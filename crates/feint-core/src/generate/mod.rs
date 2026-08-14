@@ -77,6 +77,22 @@ fn name_heuristic(column_name: &str) -> Option<&'static str> {
     }
 }
 
+/// Fake text for a bare key name (no [`Column`] to consult), keyed by the
+/// same [`name_heuristic`] patterns used for a real column's name. Used for
+/// masking a leaf inside a JSON/JSONB value at a specific path — see
+/// [`crate::mask::mask_json_column_value`] — where there is no schema
+/// column to dispatch on, only the JSON object key itself.
+pub fn fake_text_for_key(key_name: &str, rng: &mut ChaCha8Rng) -> String {
+    match name_heuristic(key_name) {
+        Some("email") => SafeEmail().fake_with_rng(rng),
+        Some("phone") => PhoneNumber().fake_with_rng(rng),
+        Some("first_name") => FirstName().fake_with_rng(rng),
+        Some("last_name") => LastName().fake_with_rng(rng),
+        Some("person_name") => Name().fake_with_rng(rng),
+        _ => Sentence(3..7).fake_with_rng(rng),
+    }
+}
+
 /// Broader PII-pattern detector used only for the `feint init` "sensitive
 /// fields detected" banner — informational, not a masking decision (there
 /// is no masking in GENERATE mode: every value is synthetic regardless).
@@ -109,6 +125,51 @@ pub fn classify_sensitive(column_name: &str) -> Option<&'static str> {
         Some("ip_address")
     } else {
         None
+    }
+}
+
+/// Recursively scan a sampled JSON/JSONB value for object keys that look
+/// sensitive by name (via [`classify_sensitive`]), returning each hit's
+/// full dot-separated path (e.g. `"contact.email"`) and the matched kind.
+/// Only walks object members — array elements are skipped, since an
+/// array's "keys" (indices) carry no name to classify. `max_depth` bounds
+/// how far into nested objects this recurses (0 = top-level keys only).
+///
+/// Used only for `feint init`'s informational "sensitive fields detected"
+/// banner: this looks at *key names* in a bounded sample of real rows,
+/// never at the values themselves, and nothing it finds is written
+/// anywhere — matches [`classify_sensitive`]'s own report-only role for
+/// plain columns.
+pub fn detect_sensitive_json_keys(
+    value: &serde_json::Value,
+    max_depth: usize,
+) -> Vec<(String, &'static str)> {
+    let mut found = Vec::new();
+    collect_sensitive_json_keys(value, "", max_depth, &mut found);
+    found
+}
+
+fn collect_sensitive_json_keys(
+    value: &serde_json::Value,
+    prefix: &str,
+    depth_remaining: usize,
+    out: &mut Vec<(String, &'static str)>,
+) {
+    let serde_json::Value::Object(map) = value else {
+        return;
+    };
+    for (key, child) in map {
+        let path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        if let Some(kind) = classify_sensitive(key) {
+            out.push((path.clone(), kind));
+        }
+        if depth_remaining > 0 {
+            collect_sensitive_json_keys(child, &path, depth_remaining - 1, out);
+        }
     }
 }
 
@@ -351,5 +412,57 @@ mod tests {
             }
             other => panic!("expected Enum, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn detect_sensitive_json_keys_finds_a_nested_match_within_depth() {
+        let value = serde_json::json!({
+            "bio": "hello",
+            "contact": { "email": "a@b.com", "note": "fine" }
+        });
+        let found = detect_sensitive_json_keys(&value, 2);
+        assert!(found.contains(&("contact.email".to_string(), "email")));
+        assert!(!found.iter().any(|(p, _)| p == "bio"));
+        assert!(!found.iter().any(|(p, _)| p == "contact.note"));
+    }
+
+    #[test]
+    fn detect_sensitive_json_keys_respects_max_depth() {
+        let value = serde_json::json!({ "a": { "b": { "ssn": "123-45-6789" } } });
+        // depth 0: only top-level keys ("a") are checked — no match.
+        assert!(detect_sensitive_json_keys(&value, 0).is_empty());
+        // depth 2 reaches "a.b.ssn".
+        let found = detect_sensitive_json_keys(&value, 2);
+        assert!(found.iter().any(|(p, _)| p == "a.b.ssn"));
+    }
+
+    #[test]
+    fn detect_sensitive_json_keys_ignores_array_elements() {
+        let value = serde_json::json!({ "tags": ["email", "phone"] });
+        assert!(detect_sensitive_json_keys(&value, 2).is_empty());
+    }
+
+    #[test]
+    fn fake_text_for_key_is_deterministic_and_type_appropriate_by_key_name() {
+        let mut rng_a = derive_rng(
+            "seed",
+            &SeedKey {
+                table: "t",
+                column: "profile.contact.email",
+                row_identity: "1",
+            },
+        );
+        let mut rng_b = derive_rng(
+            "seed",
+            &SeedKey {
+                table: "t",
+                column: "profile.contact.email",
+                row_identity: "1",
+            },
+        );
+        let a = fake_text_for_key("email", &mut rng_a);
+        let b = fake_text_for_key("email", &mut rng_b);
+        assert_eq!(a, b);
+        assert!(a.contains('@'), "expected an email-shaped fake value");
     }
 }

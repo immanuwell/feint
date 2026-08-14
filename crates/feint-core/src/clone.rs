@@ -113,20 +113,31 @@ pub(crate) fn mask_rows(
                 .iter()
                 .enumerate()
                 .map(|(i, col)| {
-                    let override_strategy = overrides.get(&col.name).and_then(|c| c.mask);
-                    let strategy = mask::resolve_mask_strategy(table, col, override_strategy);
-                    let generator_override = overrides
-                        .get(&col.name)
-                        .and_then(|c| c.generator.as_deref());
-                    mask::mask_value(
-                        strategy,
-                        col,
-                        generator_override,
-                        &row[i],
-                        &config.seed,
-                        &table_name,
-                        &row_identity,
-                    )
+                    let col_config = overrides.get(&col.name);
+                    let json_paths = col_config.map(|c| &c.json_paths);
+                    if let Some(paths) = json_paths.filter(|p| !p.is_empty()) {
+                        Ok(mask::mask_json_column_value(
+                            paths,
+                            &row[i],
+                            &config.seed,
+                            &table_name,
+                            &col.name,
+                            &row_identity,
+                        ))
+                    } else {
+                        let override_strategy = col_config.and_then(|c| c.mask);
+                        let strategy = mask::resolve_mask_strategy(table, col, override_strategy);
+                        let generator_override = col_config.and_then(|c| c.generator.as_deref());
+                        mask::mask_value(
+                            strategy,
+                            col,
+                            generator_override,
+                            &row[i],
+                            &config.seed,
+                            &table_name,
+                            &row_identity,
+                        )
+                    }
                 })
                 .collect::<Result<Vec<PgValue>>>()
         })

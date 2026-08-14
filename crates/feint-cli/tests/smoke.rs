@@ -113,6 +113,65 @@ async fn init_then_up_smoke_test() {
     let _ = std::fs::remove_file(&config_path);
 }
 
+/// `feint init` samples real JSONB values (key names only, never the
+/// values) and flags keys that look sensitive by name, at any depth. This
+/// runs the actual sampling query against a real container rather than
+/// unit-testing `detect_sensitive_json_keys` in isolation, so it also
+/// proves the CLI wires the DB sample through to the banner correctly.
+#[tokio::test]
+async fn init_reports_sensitive_keys_inside_jsonb() {
+    let container = Postgres::default()
+        .with_tag("16-alpine")
+        .start()
+        .await
+        .expect("start postgres testcontainer (is Docker running?)");
+    let port = container
+        .get_host_port_ipv4(5432)
+        .await
+        .expect("mapped port");
+    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+
+    let (client, connection) = tokio_postgres::connect(&url, NoTls).await.expect("connect");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .batch_execute(
+            "CREATE TABLE users (id serial PRIMARY KEY, profile jsonb); \
+             INSERT INTO users (profile) VALUES \
+             ('{\"bio\": \"loves hiking\", \"contact\": {\"email\": \"a@corp.com\"}}'), \
+             ('{\"bio\": \"builds things\", \"contact\": {\"email\": \"b@corp.com\"}}');",
+        )
+        .await
+        .expect("create smoke-test schema");
+
+    let config_path =
+        std::env::temp_dir().join(format!("feint_json_init_smoke_{}.yaml", std::process::id()));
+
+    let init_output = Command::cargo_bin("feint")
+        .unwrap()
+        .args(["init", &url, "--config"])
+        .arg(&config_path)
+        .output()
+        .expect("run feint init");
+    assert!(
+        init_output.status.success(),
+        "feint init failed: {}",
+        String::from_utf8_lossy(&init_output.stderr)
+    );
+    let init_stdout = String::from_utf8_lossy(&init_output.stdout);
+    assert!(
+        init_stdout.contains("users.profile.contact.email"),
+        "init stdout should flag the nested sensitive JSON key: {init_stdout}"
+    );
+    assert!(
+        !init_stdout.contains("users.profile.bio"),
+        "init stdout should not flag a JSON key that doesn't look sensitive: {init_stdout}"
+    );
+
+    let _ = std::fs::remove_file(&config_path);
+}
+
 /// End-to-end fail-closed masking: `feint classify` writes and checks a
 /// lockfile, and `feint mask --strict` refuses to run against a database
 /// whose schema has drifted from it, all through the real compiled
