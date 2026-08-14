@@ -113,7 +113,7 @@ Linux and macOS, prebuilt binary:
 curl -fsSL https://raw.githubusercontent.com/immanuwell/feint/main/install.sh | sh
 ```
 
-Installs to `~/.local/bin`. Set `FEINT_VERSION=vX.Y.Z` to pin a version instead of the latest release.
+Installs to `~/.local/bin`. Set `FEINT_VERSION=X.Y.Z` to pin a version instead of the latest release.
 
 Or build from source (needs Rust and Cargo, get them from [rustup.rs](https://rustup.rs)):
 

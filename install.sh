@@ -3,7 +3,7 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/immanuwell/feint/main/install.sh | sh
 #
-# Set FEINT_VERSION to pin a version (e.g. FEINT_VERSION=v0.1.0). Set
+# Set FEINT_VERSION to pin a version (e.g. FEINT_VERSION=0.1.0). Set
 # FEINT_INSTALL_DIR to install somewhere other than ~/.local/bin.
 
 set -eu

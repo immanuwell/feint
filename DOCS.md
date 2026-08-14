@@ -24,7 +24,7 @@ On Linux or macOS, install the prebuilt binary:
 curl -fsSL https://raw.githubusercontent.com/immanuwell/feint/main/install.sh | sh
 ```
 
-This installs to `~/.local/bin`. Set `FEINT_VERSION=vX.Y.Z` before running it to pin a specific version instead of the latest release. Set `FEINT_INSTALL_DIR` to install somewhere else.
+This installs to `~/.local/bin`. Set `FEINT_VERSION=X.Y.Z` before running it to pin a specific version instead of the latest release. Set `FEINT_INSTALL_DIR` to install somewhere else.
 
 Or build from source. Requirements: Rust and Cargo (get them from rustup.rs), and access to a Postgres database.
 

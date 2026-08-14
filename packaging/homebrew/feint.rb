@@ -11,17 +11,17 @@ class Feint < Formula
 
   on_macos do
     on_arm do
-      url "https://github.com/immanuwell/feint/releases/download/v0.1.0/feint-v0.1.0-aarch64-apple-darwin.tar.gz"
+      url "https://github.com/immanuwell/feint/releases/download/0.1.0/feint-0.1.0-aarch64-apple-darwin.tar.gz"
       sha256 "REPLACE_WITH_REAL_SHA256"
     end
     on_intel do
-      url "https://github.com/immanuwell/feint/releases/download/v0.1.0/feint-v0.1.0-x86_64-apple-darwin.tar.gz"
+      url "https://github.com/immanuwell/feint/releases/download/0.1.0/feint-0.1.0-x86_64-apple-darwin.tar.gz"
       sha256 "REPLACE_WITH_REAL_SHA256"
     end
   end
 
   on_linux do
-    url "https://github.com/immanuwell/feint/releases/download/v0.1.0/feint-v0.1.0-x86_64-unknown-linux-gnu.tar.gz"
+    url "https://github.com/immanuwell/feint/releases/download/0.1.0/feint-0.1.0-x86_64-unknown-linux-gnu.tar.gz"
     sha256 "REPLACE_WITH_REAL_SHA256"
   end
 

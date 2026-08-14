@@ -13,15 +13,15 @@ live after a real GitHub release exists.
 
 ## After every release
 
-1. Cut a release (push a `v*.*.*` tag; see the root README's Install
+1. Cut a release (push a `[0-9]+.[0-9]+.[0-9]+` tag; see the root README's Install
    section). Wait for the `Release` GitHub Actions workflow to finish
    building and uploading the platform archives.
 2. Compute the sha256 of each archive:
 
    ```
-   curl -sL https://github.com/immanuwell/feint/releases/download/vX.Y.Z/feint-vX.Y.Z-aarch64-apple-darwin.tar.gz | sha256sum
-   curl -sL https://github.com/immanuwell/feint/releases/download/vX.Y.Z/feint-vX.Y.Z-x86_64-apple-darwin.tar.gz | sha256sum
-   curl -sL https://github.com/immanuwell/feint/releases/download/vX.Y.Z/feint-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz | sha256sum
+   curl -sL https://github.com/immanuwell/feint/releases/download/X.Y.Z/feint-X.Y.Z-aarch64-apple-darwin.tar.gz | sha256sum
+   curl -sL https://github.com/immanuwell/feint/releases/download/X.Y.Z/feint-X.Y.Z-x86_64-apple-darwin.tar.gz | sha256sum
+   curl -sL https://github.com/immanuwell/feint/releases/download/X.Y.Z/feint-X.Y.Z-x86_64-unknown-linux-gnu.tar.gz | sha256sum
    ```
 
 3. Update `version` and the three `url`/`sha256` pairs in `feint.rb` to
