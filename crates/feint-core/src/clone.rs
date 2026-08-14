@@ -15,10 +15,10 @@ use std::collections::{HashMap, HashSet};
 use postgres_types::ToSql;
 use tokio_postgres::Transaction;
 
-use crate::config::FeintConfig;
+use crate::config::{FeintConfig, TableStrategy};
 use crate::error::{FeintError, Result};
 use crate::graph::{FkRef, InsertGroup, InsertPlan};
-use crate::insert::{execute_batched_insert, sql_cast_type};
+use crate::insert::{self, execute_batched_insert, sql_cast_type, RefPool};
 use crate::introspect::{Column, Identity, Schema, Table, TableId};
 use crate::mask::{self, validate_masking_config};
 use crate::subset::SubsetRows;
@@ -133,6 +133,103 @@ fn mask_rows(
         .collect()
 }
 
+fn table_strategy(config: &FeintConfig, table_id: &TableId) -> TableStrategy {
+    config
+        .table_config(&table_id.qualified())
+        .map(|t| t.strategy)
+        .unwrap_or_default()
+}
+
+/// The hybrid run's soundness rules, checked before any table is read or
+/// written. Two things can make a mixed `mask`/`generate` run produce a
+/// database with dangling foreign keys, so both are hard errors rather
+/// than a best-effort attempt:
+///
+/// 1. A `mask` table's foreign key can never point at a `generate` table.
+///    `mask` preserves the source's real foreign-key values verbatim; a
+///    `generate` table's rows have an entirely fabricated key space that
+///    those real values essentially never happen to match.
+/// 2. Every table inside one foreign-key cycle (a `Deferred` or `Backfill`
+///    group — see `graph.rs`) must share the same strategy. Resolving a
+///    cycle that mixes known-real values with not-yet-known synthetic
+///    ones is a real problem, just not one this run needs to solve: every
+///    real-world hybrid example is a straightforward parent/child split,
+///    not a cyclic one.
+fn validate_hybrid_config(schema: &Schema, config: &FeintConfig, plan: &InsertPlan) -> Result<()> {
+    for table in &schema.tables {
+        if table_strategy(config, &table.id) != TableStrategy::Mask {
+            continue;
+        }
+        for fk in &table.foreign_keys {
+            if table_strategy(config, &fk.ref_table) == TableStrategy::Generate {
+                return Err(FeintError::Config(format!(
+                    "table `{}` is `strategy: mask` but its foreign key `{}` points at `{}`, \
+                     which is `strategy: generate`. A masked table's real foreign-key values \
+                     can't be satisfied by a table with fabricated keys — set `{}` to \
+                     `strategy: mask` too, or remove this foreign key from the hybrid run.",
+                    table.id.qualified(),
+                    fk.name,
+                    fk.ref_table.qualified(),
+                    fk.ref_table.qualified()
+                )));
+            }
+        }
+    }
+
+    for group in &plan.groups {
+        let tables: &[TableId] = match group {
+            InsertGroup::Deferred(t) => t,
+            InsertGroup::Backfill { tables, .. } => tables,
+            InsertGroup::Simple(_) => continue,
+        };
+        if tables.len() < 2 {
+            continue;
+        }
+        let strategies: HashSet<TableStrategy> =
+            tables.iter().map(|t| table_strategy(config, t)).collect();
+        if strategies.len() > 1 {
+            let names = tables
+                .iter()
+                .map(|t| t.qualified())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(FeintError::Config(format!(
+                "tables [{names}] form a foreign-key cycle and must all use the same \
+                 `strategy:` — mixing `mask` and `generate` within one cycle isn't supported. \
+                 Set them all to the same strategy."
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Registers every already-known value (a real, masked row for a `mask`
+/// table) into `ref_pool` so a later `generate`-strategy table can sample
+/// a real, valid reference to it. Unlike GENERATE mode's
+/// `register_returned`, no `RETURNING` round trip is needed — CLONE mode
+/// preserves the source's real primary/unique key values, known before
+/// any target write happens.
+fn register_rows_in_ref_pool(
+    ref_pool: &mut RefPool,
+    table: &Table,
+    columns: &[&Column],
+    rows: &[Vec<PgValue>],
+) {
+    for uc in &table.unique_constraints {
+        let indices: Option<Vec<usize>> = uc
+            .columns
+            .iter()
+            .map(|c| columns.iter().position(|col| &col.name == c))
+            .collect();
+        let Some(indices) = indices else { continue };
+        for row in rows {
+            let tuple: Vec<PgValue> = indices.iter().map(|&i| row[i].clone()).collect();
+            ref_pool.register(&table.id, &uc.columns, tuple);
+        }
+    }
+}
+
 fn pgvalue_as_i64(value: &PgValue) -> Option<i64> {
     match value {
         PgValue::Int2(v) => Some(*v as i64),
@@ -199,9 +296,17 @@ pub async fn run(
     mut progress: impl FnMut(ProgressEvent),
 ) -> Result<CloneSummary> {
     validate_masking_config(schema, config)?;
+    validate_hybrid_config(schema, config, plan)?;
     target_txn
         .batch_execute("SET CONSTRAINTS ALL DEFERRED")
         .await?;
+
+    // Shared across the whole run so a `generate`-strategy table anywhere
+    // downstream can sample a real primary key from an already-cloned
+    // `mask` table, or a synthesized one from an already-generated table —
+    // exactly the mechanism GENERATE mode (`insert.rs`) already uses for
+    // its own FK resolution, reused here rather than reimplemented.
+    let mut ref_pool = RefPool::default();
 
     let mut rows_by_table = Vec::new();
     let mut total_rows = 0u64;
@@ -213,7 +318,30 @@ pub async fn run(
                 progress(ProgressEvent::TableStarted {
                     table: &table_id.qualified(),
                 });
-                let n = clone_table_full(source_txn, target_txn, table, config, subset).await?;
+                let n = match table_strategy(config, table_id) {
+                    TableStrategy::Mask => {
+                        clone_table_full(
+                            source_txn,
+                            target_txn,
+                            table,
+                            config,
+                            subset,
+                            &mut ref_pool,
+                        )
+                        .await?
+                    }
+                    TableStrategy::Generate => {
+                        insert::insert_plain_table(
+                            target_txn,
+                            table,
+                            insert::rows_for(config, table_id),
+                            config,
+                            &HashSet::new(),
+                            &mut ref_pool,
+                        )
+                        .await?
+                    }
+                };
                 progress(ProgressEvent::TableFinished {
                     table: &table_id.qualified(),
                     rows: n,
@@ -222,38 +350,93 @@ pub async fn run(
                 total_rows += n;
             }
             InsertGroup::Deferred(tables) => {
-                for table_id in tables {
-                    let table = schema.table(table_id).expect("table exists in schema");
-                    progress(ProgressEvent::TableStarted {
-                        table: &table_id.qualified(),
-                    });
-                    let n = clone_table_full(source_txn, target_txn, table, config, subset).await?;
-                    progress(ProgressEvent::TableFinished {
-                        table: &table_id.qualified(),
-                        rows: n,
-                    });
-                    rows_by_table.push((table_id.qualified(), n));
-                    total_rows += n;
+                // Uniform strategy within the group is guaranteed by
+                // `validate_hybrid_config`, so the first table speaks for
+                // all of them.
+                if tables
+                    .first()
+                    .is_some_and(|t| table_strategy(config, t) == TableStrategy::Generate)
+                {
+                    let results = insert::insert_deferred_group(
+                        target_txn,
+                        schema,
+                        tables,
+                        config,
+                        &mut ref_pool,
+                        &mut |_evt| {},
+                    )
+                    .await?;
+                    for (t, n) in results {
+                        progress(ProgressEvent::TableStarted { table: &t });
+                        progress(ProgressEvent::TableFinished { table: &t, rows: n });
+                        total_rows += n;
+                        rows_by_table.push((t, n));
+                    }
+                } else {
+                    for table_id in tables {
+                        let table = schema.table(table_id).expect("table exists in schema");
+                        progress(ProgressEvent::TableStarted {
+                            table: &table_id.qualified(),
+                        });
+                        let n = clone_table_full(
+                            source_txn,
+                            target_txn,
+                            table,
+                            config,
+                            subset,
+                            &mut ref_pool,
+                        )
+                        .await?;
+                        progress(ProgressEvent::TableFinished {
+                            table: &table_id.qualified(),
+                            rows: n,
+                        });
+                        rows_by_table.push((table_id.qualified(), n));
+                        total_rows += n;
+                    }
                 }
             }
             InsertGroup::Backfill {
                 tables,
                 null_then_backfill,
             } => {
-                let n = clone_backfill_group(
-                    source_txn,
-                    target_txn,
-                    schema,
-                    tables,
-                    null_then_backfill,
-                    config,
-                    subset,
-                    &mut progress,
-                )
-                .await?;
-                for (t, c) in n {
-                    total_rows += c;
-                    rows_by_table.push((t, c));
+                if tables
+                    .first()
+                    .is_some_and(|t| table_strategy(config, t) == TableStrategy::Generate)
+                {
+                    let results = insert::insert_backfill_group(
+                        target_txn,
+                        schema,
+                        tables,
+                        null_then_backfill,
+                        config,
+                        &mut ref_pool,
+                        &mut |_evt| {},
+                    )
+                    .await?;
+                    for (t, n) in results {
+                        progress(ProgressEvent::TableStarted { table: &t });
+                        progress(ProgressEvent::TableFinished { table: &t, rows: n });
+                        total_rows += n;
+                        rows_by_table.push((t, n));
+                    }
+                } else {
+                    let n = clone_backfill_group(
+                        source_txn,
+                        target_txn,
+                        schema,
+                        tables,
+                        null_then_backfill,
+                        config,
+                        subset,
+                        &mut ref_pool,
+                        &mut progress,
+                    )
+                    .await?;
+                    for (t, c) in n {
+                        total_rows += c;
+                        rows_by_table.push((t, c));
+                    }
                 }
             }
         }
@@ -271,10 +454,12 @@ async fn clone_table_full(
     table: &Table,
     config: &FeintConfig,
     subset: Option<&SubsetRows>,
+    ref_pool: &mut RefPool,
 ) -> Result<u64> {
     let columns = clone_supplied_columns(table);
     let rows = read_table_rows(source_txn, table, &columns, subset).await?;
     let rows = mask_rows(table, &columns, rows, config)?;
+    register_rows_in_ref_pool(ref_pool, table, &columns, &rows);
     let overriding = needs_overriding_system_value(&columns);
     execute_batched_insert(target_txn, table, &columns, &rows, &[], overriding).await?;
     resync_sequences(target_txn, table, &columns, &rows).await?;
@@ -290,6 +475,7 @@ async fn clone_backfill_group(
     null_then_backfill: &[FkRef],
     config: &FeintConfig,
     subset: Option<&SubsetRows>,
+    ref_pool: &mut RefPool,
     progress: &mut impl FnMut(ProgressEvent),
 ) -> Result<Vec<(String, u64)>> {
     let mut skip_by_table: HashMap<TableId, HashSet<String>> = HashMap::new();
@@ -312,6 +498,7 @@ async fn clone_backfill_group(
         let columns = clone_supplied_columns(table);
         let full_rows = read_table_rows(source_txn, table, &columns, subset).await?;
         let full_rows = mask_rows(table, &columns, full_rows, config)?;
+        register_rows_in_ref_pool(ref_pool, table, &columns, &full_rows);
 
         let skip = skip_by_table.get(table_id).cloned().unwrap_or_default();
         let skip_indices: Vec<usize> = columns

@@ -30,6 +30,7 @@ fn config_with(table: &str, columns: Vec<(&str, MaskStrategy)>) -> FeintConfig {
         table.to_string(),
         TableConfig {
             rows: 0,
+            strategy: Default::default(),
             columns: cols,
         },
     );

@@ -21,9 +21,32 @@ pub struct ColumnConfig {
     pub mask: Option<MaskStrategy>,
 }
 
+/// Per-table behavior for `clone`'s hybrid mode: clone this table's real
+/// rows (masked, as always), or leave the real rows alone entirely and pad
+/// with `rows:` synthetic rows generated the same way `up` would. See
+/// [`crate::clone`] and DOCS.md's "Hybrid clone" section for the
+/// soundness rule this implies about which tables can reference which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TableStrategy {
+    #[default]
+    Mask,
+    Generate,
+}
+
+impl TableStrategy {
+    fn is_default(&self) -> bool {
+        *self == TableStrategy::Mask
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TableConfig {
     pub rows: u32,
+    /// See [`TableStrategy`]. Defaults to `mask` — a table this key never
+    /// mentions behaves exactly as `clone` always has.
+    #[serde(default, skip_serializing_if = "TableStrategy::is_default")]
+    pub strategy: TableStrategy,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub columns: BTreeMap<String, ColumnConfig>,
 }
@@ -50,6 +73,7 @@ impl FeintConfig {
                     t.id.qualified(),
                     TableConfig {
                         rows: DEFAULT_ROWS,
+                        strategy: TableStrategy::default(),
                         columns: BTreeMap::new(),
                     },
                 )
@@ -99,6 +123,10 @@ impl FeintConfig {
                 }
             }
             out.push_str(&format!("    rows: {}\n", table_config.rows));
+            if !table_config.strategy.is_default() {
+                let s = serde_yaml_ng::to_string(&table_config.strategy).unwrap_or_default();
+                out.push_str(&format!("    strategy: {}\n", s.trim()));
+            }
             if !table_config.columns.is_empty() {
                 out.push_str("    columns:\n");
                 for (col_name, col_config) in &table_config.columns {

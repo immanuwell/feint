@@ -223,6 +223,7 @@ pub fn apply_policy(
                     .entry(table_name.clone())
                     .or_insert_with(|| TableConfig {
                         rows: DEFAULT_ROWS,
+                        strategy: Default::default(),
                         columns: Default::default(),
                     });
             let has_existing_mask = table_entry
@@ -377,6 +378,7 @@ mod tests {
             "public.users".to_string(),
             TableConfig {
                 rows: DEFAULT_ROWS,
+                strategy: Default::default(),
                 columns: BTreeMap::from([(
                     "email".to_string(),
                     ColumnConfig {

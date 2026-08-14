@@ -50,6 +50,7 @@ fn config_for(table: &str) -> FeintConfig {
         table.to_string(),
         TableConfig {
             rows: 0,
+            strategy: Default::default(),
             columns: cols,
         },
     );

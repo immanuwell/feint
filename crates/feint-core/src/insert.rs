@@ -37,12 +37,16 @@ pub struct RunSummary {
 /// generated row, and a table referenced through more than one unique
 /// constraint keeps a separate pool per constraint.
 #[derive(Default)]
-struct RefPool {
+pub(crate) struct RefPool {
     pools: HashMap<(TableId, Vec<String>), Vec<Vec<PgValue>>>,
 }
 
 impl RefPool {
-    fn register(&mut self, table: &TableId, columns: &[String], tuple: Vec<PgValue>) {
+    /// `pub(crate)`: also called directly from `clone.rs` to register a
+    /// hybrid run's already-known real (masked) primary keys, which need
+    /// no `RETURNING` round trip the way GENERATE mode's server-assigned
+    /// keys do.
+    pub(crate) fn register(&mut self, table: &TableId, columns: &[String], tuple: Vec<PgValue>) {
         if tuple.iter().any(PgValue::is_null) {
             // A NULL participant can't satisfy MATCH SIMPLE FK lookups
             // reliably as a sampled target; skip registering it.
@@ -151,7 +155,7 @@ pub async fn run(
     })
 }
 
-fn rows_for(config: &FeintConfig, table_id: &TableId) -> u32 {
+pub(crate) fn rows_for(config: &FeintConfig, table_id: &TableId) -> u32 {
     config
         .table_config(&table_id.qualified())
         .map(|t| t.rows)
@@ -395,7 +399,7 @@ fn register_returned(
     }
 }
 
-async fn insert_plain_table(
+pub(crate) async fn insert_plain_table(
     txn: &Transaction<'_>,
     table: &Table,
     planned_rows: u32,
@@ -430,7 +434,7 @@ async fn insert_plain_table(
     Ok(rows.len() as u64)
 }
 
-async fn insert_backfill_group(
+pub(crate) async fn insert_backfill_group(
     txn: &Transaction<'_>,
     schema: &Schema,
     tables: &[TableId],
@@ -579,7 +583,7 @@ async fn insert_backfill_group(
     Ok(results)
 }
 
-async fn insert_deferred_group(
+pub(crate) async fn insert_deferred_group(
     txn: &Transaction<'_>,
     schema: &Schema,
     tables: &[TableId],

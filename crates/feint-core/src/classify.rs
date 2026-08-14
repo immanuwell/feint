@@ -319,6 +319,7 @@ mod tests {
                 "public.users".to_string(),
                 crate::config::TableConfig {
                     rows: 10,
+                    strategy: Default::default(),
                     columns: BTreeMap::from([(
                         "email".to_string(),
                         crate::config::ColumnConfig {
@@ -337,6 +338,7 @@ mod tests {
             "public.users".to_string(),
             crate::config::TableConfig {
                 rows: 10,
+                strategy: Default::default(),
                 columns: BTreeMap::from([(
                     "email".to_string(),
                     crate::config::ColumnConfig {

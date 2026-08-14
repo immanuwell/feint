@@ -133,6 +133,7 @@ async fn an_explicit_mask_none_override_on_a_sensitive_column_is_visible_in_the_
         table_key,
         TableConfig {
             rows: 0,
+            strategy: Default::default(),
             columns: BTreeMap::from([(
                 "email".to_string(),
                 ColumnConfig {
@@ -177,6 +178,7 @@ async fn weakening_a_masked_column_to_none_is_caught_as_changed_drift() {
             table_key.clone(),
             TableConfig {
                 rows: 0,
+                strategy: Default::default(),
                 columns: BTreeMap::from([(
                     "email".to_string(),
                     ColumnConfig {
@@ -196,6 +198,7 @@ async fn weakening_a_masked_column_to_none_is_caught_as_changed_drift() {
             table_key,
             TableConfig {
                 rows: 0,
+                strategy: Default::default(),
                 columns: BTreeMap::from([(
                     "email".to_string(),
                     ColumnConfig {

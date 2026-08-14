@@ -85,6 +85,7 @@ pub fn migrate_neosync(job_json: &str) -> Result<NeosyncMigration, serde_json::E
             .entry(table_key.clone())
             .or_insert_with(|| TableConfig {
                 rows: DEFAULT_ROWS,
+                strategy: Default::default(),
                 columns: BTreeMap::new(),
             });
 

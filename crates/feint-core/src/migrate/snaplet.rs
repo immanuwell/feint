@@ -51,6 +51,7 @@ pub fn migrate_snaplet(config_ts_source: &str, seed_ts_source: Option<&str>) -> 
                     .entry(normalize_table_name(name))
                     .or_insert_with(|| TableConfig {
                         rows: DEFAULT_ROWS,
+                        strategy: Default::default(),
                         columns: BTreeMap::new(),
                     });
             }

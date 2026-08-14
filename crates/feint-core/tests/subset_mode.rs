@@ -31,6 +31,7 @@ fn config_with_unmasked_name(table: &str) -> FeintConfig {
         table.to_string(),
         TableConfig {
             rows: 0,
+            strategy: Default::default(),
             columns: cols,
         },
     );
