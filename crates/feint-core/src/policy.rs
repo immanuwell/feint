@@ -51,9 +51,18 @@ pub const PII: Policy = Policy {
     ],
 };
 
+// Coverage note (see DOCS.md's "feint policy" section for the full
+// explanation): this targets HIPAA Safe Harbor's 18 identifier classes as
+// closely as a column-name-substring policy reasonably can. One class is
+// deliberately not pattern-matched: "ages over 89 must be aggregated to
+// 90+". "age" is too short and too common a substring of ordinary English
+// words (storage, message, usage, language, package, average, wage, ...)
+// to match safely — a blanket rule would risk silently redacting unrelated
+// columns. Add an explicit `mask: redact` override by hand for a real age
+// column if this class matters to you.
 pub const HEALTHCARE: Policy = Policy {
     name: "healthcare",
-    description: "Medical and insurance data: record numbers, diagnoses, medications, patient identity, policy numbers.",
+    description: "Medical and insurance data: record numbers, diagnoses, medications, patient identity, policy numbers. Targets HIPAA Safe Harbor's identifier list; see DOCS.md for exact coverage.",
     rules: &[
         PolicyRule { pattern: "medical_record", strategy: MaskStrategy::Hash, generator: None },
         PolicyRule { pattern: "mrn", strategy: MaskStrategy::Hash, generator: None },
@@ -64,6 +73,16 @@ pub const HEALTHCARE: Policy = Policy {
         PolicyRule { pattern: "medication", strategy: MaskStrategy::Redact, generator: None },
         PolicyRule { pattern: "policy_number", strategy: MaskStrategy::Hash, generator: None },
         PolicyRule { pattern: "insurance_id", strategy: MaskStrategy::Hash, generator: None },
+        PolicyRule { pattern: "beneficiary_number", strategy: MaskStrategy::Hash, generator: None },
+        PolicyRule { pattern: "beneficiary_id", strategy: MaskStrategy::Hash, generator: None },
+        PolicyRule { pattern: "account_number", strategy: MaskStrategy::Hash, generator: None },
+        PolicyRule { pattern: "certificate_number", strategy: MaskStrategy::Redact, generator: None },
+        PolicyRule { pattern: "license", strategy: MaskStrategy::Redact, generator: None },
+        PolicyRule { pattern: "vehicle", strategy: MaskStrategy::Redact, generator: None },
+        PolicyRule { pattern: "device", strategy: MaskStrategy::Redact, generator: None },
+        PolicyRule { pattern: "_url", strategy: MaskStrategy::Redact, generator: None },
+        PolicyRule { pattern: "ip_address", strategy: MaskStrategy::Fake, generator: Some("inet") },
+        PolicyRule { pattern: "fax", strategy: MaskStrategy::Fake, generator: Some("phone") },
         PolicyRule { pattern: "patient_name", strategy: MaskStrategy::Fake, generator: Some("person_name") },
         PolicyRule { pattern: "subscriber_name", strategy: MaskStrategy::Fake, generator: Some("person_name") },
         PolicyRule { pattern: "first_name", strategy: MaskStrategy::Fake, generator: Some("first_name") },
@@ -74,6 +93,11 @@ pub const HEALTHCARE: Policy = Policy {
         PolicyRule { pattern: "ssn", strategy: MaskStrategy::Redact, generator: None },
         PolicyRule { pattern: "email", strategy: MaskStrategy::Fake, generator: Some("email") },
         PolicyRule { pattern: "phone", strategy: MaskStrategy::Fake, generator: Some("phone") },
+        PolicyRule { pattern: "street", strategy: MaskStrategy::Redact, generator: None },
+        PolicyRule { pattern: "address", strategy: MaskStrategy::Redact, generator: None },
+        PolicyRule { pattern: "city", strategy: MaskStrategy::Redact, generator: None },
+        PolicyRule { pattern: "zip_code", strategy: MaskStrategy::Redact, generator: None },
+        PolicyRule { pattern: "postal_code", strategy: MaskStrategy::Redact, generator: None },
     ],
 };
 
@@ -393,5 +417,55 @@ mod tests {
             match_rule(&PAYMENTS, "routing_number").unwrap().strategy,
             MaskStrategy::Hash
         );
+    }
+
+    #[test]
+    fn healthcare_policy_covers_the_added_hipaa_safe_harbor_identifier_classes() {
+        let cases: &[(&str, MaskStrategy)] = &[
+            ("patient_street_address", MaskStrategy::Redact),
+            ("city", MaskStrategy::Redact),
+            ("zip_code", MaskStrategy::Redact),
+            ("postal_code", MaskStrategy::Redact),
+            ("account_number", MaskStrategy::Hash),
+            ("beneficiary_number", MaskStrategy::Hash),
+            ("beneficiary_id", MaskStrategy::Hash),
+            ("medical_license_number", MaskStrategy::Redact),
+            ("certificate_number", MaskStrategy::Redact),
+            ("vehicle_id", MaskStrategy::Redact),
+            ("device_serial", MaskStrategy::Redact),
+            ("profile_url", MaskStrategy::Redact),
+            ("ip_address", MaskStrategy::Fake),
+            ("fax_number", MaskStrategy::Fake),
+        ];
+        for (column, expected) in cases {
+            let rule = match_rule(&HEALTHCARE, column)
+                .unwrap_or_else(|| panic!("expected `{column}` to match a healthcare rule"));
+            assert_eq!(rule.strategy, *expected, "wrong strategy for `{column}`");
+        }
+    }
+
+    #[test]
+    fn healthcare_policy_does_not_false_positive_on_words_that_merely_contain_a_short_pattern() {
+        // Regression coverage for the substring-matching mechanism this
+        // policy is built on: short patterns like "vin" or "age" would
+        // match ordinary English words if used, which is exactly why the
+        // healthcare policy avoids them (see the coverage note above
+        // `HEALTHCARE`). These columns must not match anything.
+        let unrelated = [
+            "living_situation", // would false-positive on a naive "vin" pattern
+            "hourly_rate",      // would false-positive on a naive "url" pattern
+            "storage_location", // would false-positive on a naive "age" pattern
+            "average_wait_time",
+            "language_preference",
+            "status",
+        ];
+        for column in unrelated {
+            assert!(
+                match_rule(&HEALTHCARE, column).is_none(),
+                "`{column}` should not match any healthcare rule, but it matched \
+                 `{:?}`",
+                match_rule(&HEALTHCARE, column).map(|r| r.pattern)
+            );
+        }
     }
 }
