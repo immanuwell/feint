@@ -8,6 +8,7 @@ use feint_core::sanitize::{self, ProgressEvent};
 use feint_core::verify;
 use tokio_postgres::config::Host;
 
+use crate::commands::classify;
 use crate::ui;
 
 #[allow(clippy::too_many_arguments)]
@@ -21,6 +22,8 @@ pub async fn run(
     resume: bool,
     max_batches: Option<usize>,
     skip_verify: bool,
+    strict: bool,
+    lockfile: &Path,
 ) -> anyhow::Result<()> {
     let config = if config_path.exists() {
         FeintConfig::load(config_path)?
@@ -37,6 +40,10 @@ pub async fn run(
     let spinner = ui::spinner("Inspecting schema...");
     let schema = introspect::introspect(&client, schemas).await?;
     spinner.finish_and_clear();
+
+    if strict {
+        classify::check_strict(&schema, &config, lockfile)?;
+    }
 
     let plan = sanitize::plan_sanitization(&schema, &config)?;
 

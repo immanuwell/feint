@@ -194,6 +194,19 @@ Two rules, same as everywhere else in masking:
 - A primary key or foreign key column is never matched, even if its name looks sensitive. `feint policy apply` reports how many columns were skipped for this reason.
 - A column that already has an explicit `mask:` set is left alone, so applying a policy never silently overwrites a choice you already made by hand. Pass `--force` to overwrite anyway. This also means you can apply more than one policy to the same config: run `pii` then `payments`, and columns both would touch (like `email`) keep whichever policy set them first.
 
+### feint classify
+
+```
+feint classify <DATABASE_URL> [--config <PATH>] [--schema <NAME>]... [--lockfile <PATH>] [--write] [--check]
+```
+
+Reports which columns look sensitive by name and what strategy they'd resolve to, then compares that against a committed lockfile so a schema change nobody reviewed shows up as a failure instead of silence. See [Fail-closed masking](#fail-closed-masking---strict) for why this exists and how it fits with `mask --strict` and `clone --strict`.
+
+- With no flags, prints the classification report and, if a lockfile exists, the diff against it. Always exits 0. This is the "what would this decide" mode.
+- `--write` approves the current classification: writes it to the lockfile. Do this after reviewing the report, and commit the file.
+- `--check` exits non-zero if the lockfile is missing, or if the live schema has drifted from it. This is the CI mode.
+- `--lockfile <PATH>` sets where the lockfile lives. Default `feint.lock.yaml`.
+
 ## Masking
 
 `clone` and `mask` share the same masking logic and the same `feint.yaml` format.
@@ -234,6 +247,35 @@ Two rules are enforced and cannot be overridden:
 - **`redact` cannot be used on a column with a unique constraint** (other than the primary key). A fixed placeholder on every row would violate uniqueness. Use `hash` or `fake` there instead, both vary per row.
 
 `mask` has one further requirement `clone` does not: a table with a column to mask must have a primary key. Masking needs a stable, ordered key to batch and checkpoint against. A table with a sensitive-looking column and no primary key is rejected with a clear error rather than skipped silently. Set `mask: none` on that column explicitly if you want to leave it alone.
+
+## Fail-closed masking (--strict)
+
+The name-based detection in [Masking](#masking) is a convenience, not a guarantee. A brand new column that the heuristic doesn't recognize silently resolves to `mask: none`, and neither `clone` nor `mask` will tell you that happened. Nobody notices until the unmasked column shows up somewhere it shouldn't.
+
+`--strict` closes that gap by requiring an approved, committed answer to "have I looked at every column" instead of trusting the heuristic every single run:
+
+```
+feint classify $PROD_URL --write         # review the report, then approve it
+git add feint.lock.yaml && git commit    # commit the approval
+
+feint mask $STAGE_URL --strict           # refuses to run if the schema drifted since the approval
+feint clone $PROD_URL $DEV_URL --strict  # same check, same flag
+```
+
+`--strict` runs the same check as `feint classify --check`, before any table is read or written:
+
+1. If `feint.lock.yaml` doesn't exist yet, the run refuses to start. There is nothing to compare against, so there is nothing to trust.
+2. If it exists, feint classifies the live schema the same way `feint classify` does, and compares it column by column against the lockfile. Any difference, a new column, a removed column, or a column whose resolved strategy changed, fails the run and prints exactly which columns changed and how.
+3. Only an exact match lets the run proceed.
+
+This is what makes the difference concrete: a `feint mask` run with no `--strict` flag masks whatever the heuristic currently decides, silently, every time, even if that decision changed since the last run. A `feint mask --strict` run only ever masks a schema a human has actually looked at and approved, and fails loudly the moment that stops being true, which is the property teams describe wanting when they say masking should be "enforced by construction, not by convention."
+
+Wire `feint classify --check` (not `--write`) into CI as a separate, cheap step: it fails fast on drift without needing a database write, and it's a natural gate before `--strict` mask/clone runs later in the same pipeline.
+
+Two things `--strict` does not do:
+
+- It does not detect PII missed by the [naming heuristic](#sensitive-field-detection) itself. If a column named `notes` happens to hold something sensitive, `--strict` will not flag it, because the heuristic doesn't flag it either. `--strict` guarantees every column's classification was consciously reviewed at least once, not that the review was correct.
+- It does not look inside JSON or JSONB values. See [Known limitations](#known-limitations).
 
 ## Deterministic identity
 
@@ -430,6 +472,7 @@ This detection is based on column name patterns only. It does not know what the 
 - `--root` subsetting only follows actual foreign key relationships. A table your application looks up outside of any foreign key is not discovered and stays empty on the target.
 - JSON and JSONB columns are masked or left alone as a whole column. feint does not look inside a JSON value for PII in a nested field.
 - `mask` requires a primary key on any table it needs to touch (see [Masking](#masking)).
+- `--strict` (see [Fail-closed masking](#fail-closed-masking---strict)) guarantees every column's classification was reviewed at least once, not that the naming heuristic behind that classification is correct. It will not catch PII in a column the heuristic itself misses.
 - `migrate` cannot convert arbitrary custom code (Snaplet's `seed.ts` generator functions, Neosync's JavaScript/user-defined transformers). These are reported as needing manual review, not guessed at.
 - TLS support covers `sslmode=require`/`prefer` (encrypted, certificate not verified) and `disable` (plain). `verify-ca`/`verify-full` (full certificate chain and hostname verification) are not implemented yet and are rejected with a clear error rather than silently downgraded.
 
@@ -455,6 +498,7 @@ The test suite includes:
 - `cross_mode_identity`, which clones a database with masking and separately masks an independent copy of the same source data in place, then asserts both runs produced byte-identical fake values for every row. This is what backs the claim in [Deterministic identity](#deterministic-identity).
 - `policy_apply`, which applies a policy template, runs the resulting config through `mask` against a real database, and checks the masked values: a redact-mapped column actually comes back null, an unmatched column passes through untouched, and applying a second policy doesn't overwrite the first policy's choices.
 - `verify_masking`, which confirms the post-mask verification pass stays quiet after a real, correct mask run, then corrupts the masked data directly (a broken hash, a non-redacted value, every row's fake value collapsed to one) and confirms verification catches each one specifically.
+- `classify_mode`, which checks the classification report and lockfile diff against a real database: sensitive columns detected, key columns excluded, a new column showing up as drift, and an explicit `mask: none` override on a sensitive-looking column being visible in the report rather than silently disappearing. The smoke test also runs the full `feint classify --write` / `--check` / `mask --strict` cycle through the real compiled binary, including the refuse-then-succeed sequence around a drifted column.
 
 ## Roadmap
 

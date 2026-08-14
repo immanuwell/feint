@@ -4,14 +4,18 @@ use feint_core::config::FeintConfig;
 use feint_core::subset::{compute_subset, parse_root, SubsetOptions};
 use feint_core::{clone, graph, introspect};
 
+use crate::commands::classify;
 use crate::ui;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     source_url: &str,
     target_url: &str,
     root: Option<String>,
     config_path: &Path,
     schemas: &[String],
+    strict: bool,
+    lockfile: &Path,
 ) -> anyhow::Result<()> {
     let config = if config_path.exists() {
         FeintConfig::load(config_path)?
@@ -29,6 +33,10 @@ pub async fn run(
     let spinner = ui::spinner("Inspecting source schema...");
     let schema = introspect::introspect(&source_client, schemas).await?;
     spinner.finish_and_clear();
+
+    if strict {
+        classify::check_strict(&schema, &config, lockfile)?;
+    }
 
     let plan = graph::plan_insertion(&schema)?;
 

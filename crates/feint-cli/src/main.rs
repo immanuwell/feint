@@ -67,6 +67,13 @@ enum Command {
         /// Schema(s) to introspect. Repeat to include more than one.
         #[arg(long = "schema", default_value = "public")]
         schemas: Vec<String>,
+        /// Fail closed: refuse to run unless the live schema's column classification exactly
+        /// matches the approved lockfile. Run `feint classify --write` first to create one.
+        #[arg(long)]
+        strict: bool,
+        /// Classification lockfile to check against when --strict is set.
+        #[arg(long, default_value = feint_core::classify::DEFAULT_LOCKFILE)]
+        lockfile: std::path::PathBuf,
     },
     /// Mask sensitive columns of a database in place. Row values only — no schema change, no row insert/delete.
     Mask {
@@ -98,6 +105,34 @@ enum Command {
         /// that was applied). On by default; skip only if the extra queries are too costly.
         #[arg(long)]
         skip_verify: bool,
+        /// Fail closed: refuse to run unless the live schema's column classification exactly
+        /// matches the approved lockfile. Run `feint classify --write` first to create one.
+        #[arg(long)]
+        strict: bool,
+        /// Classification lockfile to check against when --strict is set.
+        #[arg(long, default_value = feint_core::classify::DEFAULT_LOCKFILE)]
+        lockfile: std::path::PathBuf,
+    },
+    /// Report which columns look sensitive and what they'd be masked as, and check that against
+    /// a committed lockfile so schema drift (a new column nobody classified) fails loudly.
+    Classify {
+        /// Postgres connection URL to introspect.
+        database_url: String,
+        /// Config file with masking overrides, if present.
+        #[arg(long, default_value = "feint.yaml")]
+        config: std::path::PathBuf,
+        /// Schema(s) to introspect. Repeat to include more than one.
+        #[arg(long = "schema", default_value = "public")]
+        schemas: Vec<String>,
+        /// Lockfile to read/write.
+        #[arg(long, default_value = feint_core::classify::DEFAULT_LOCKFILE)]
+        lockfile: std::path::PathBuf,
+        /// Approve the current classification: write it to the lockfile.
+        #[arg(long)]
+        write: bool,
+        /// Exit non-zero if the lockfile is missing or the schema has drifted from it. For CI.
+        #[arg(long)]
+        check: bool,
     },
     /// Convert another tool's config to feint.yaml. Best effort — review the report before using the output.
     Migrate {
@@ -182,7 +217,20 @@ async fn main() -> anyhow::Result<()> {
             root,
             config,
             schemas,
-        } => commands::clone::run(&source_url, &target_url, root, &config, &schemas).await,
+            strict,
+            lockfile,
+        } => {
+            commands::clone::run(
+                &source_url,
+                &target_url,
+                root,
+                &config,
+                &schemas,
+                strict,
+                &lockfile,
+            )
+            .await
+        }
         Command::Mask {
             database_url,
             config,
@@ -193,6 +241,8 @@ async fn main() -> anyhow::Result<()> {
             resume,
             max_batches,
             skip_verify,
+            strict,
+            lockfile,
         } => {
             commands::mask::run(
                 &database_url,
@@ -204,8 +254,20 @@ async fn main() -> anyhow::Result<()> {
                 resume,
                 max_batches,
                 skip_verify,
+                strict,
+                &lockfile,
             )
             .await
+        }
+        Command::Classify {
+            database_url,
+            config,
+            schemas,
+            lockfile,
+            write,
+            check,
+        } => {
+            commands::classify::run(&database_url, &config, &schemas, &lockfile, write, check).await
         }
         Command::Migrate { tool } => match tool {
             MigrateTool::Snaplet {

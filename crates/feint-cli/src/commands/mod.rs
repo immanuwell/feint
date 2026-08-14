@@ -1,3 +1,4 @@
+pub mod classify;
 pub mod clone;
 pub mod init;
 pub mod mask;
