@@ -12,7 +12,9 @@ seedy is a command line tool for Postgres. It has three modes.
 
 **Mask** rewrites a database's own sensitive columns in place, on that same database, no second database involved. Command: `mask`. This is for a workflow clone can't cover: a database that already got a full physical copy from somewhere else (a cloud snapshot restore is the common case), and now needs its own PII scrubbed before anyone treats it as safe to use.
 
-`plan` only reads your schema, it never writes anything. `init`, `up`, `clone`, and `mask` all touch a database.
+Alongside the three modes, `seedy migrate` converts another tool's config (Snaplet Seed, Neosync) into a starting `seedy.yaml`, so switching tools doesn't mean starting from a blank file.
+
+`plan` only reads your schema, it never writes anything. `migrate` only reads a config file, never a database. `init`, `up`, `clone`, and `mask` all touch a database.
 
 ## Install
 
@@ -123,6 +125,31 @@ This is for a case `clone` does not cover: a database that already has a full, r
 Before and after masking each table, `mask` checks the row count is unchanged. `mask` only ever runs `UPDATE`. A row-count mismatch is a hard error, not a warning, since it would mean something else wrote to the table while masking was running.
 
 On success, `mask` prints the row count masked per table and confirms row counts and keys were untouched.
+
+### seedy migrate
+
+```
+seedy migrate snaplet <CONFIG_TS> [--seed-ts <PATH>] [--output <PATH>]
+seedy migrate neosync <JOB_JSON> [--output <PATH>]
+```
+
+Converts another tool's config into a `seedy.yaml`, as a starting point. Best effort, not a full translation. Both prompt through what got converted, what needs manual review, and why, so nothing is silently dropped or guessed.
+
+**`seedy migrate snaplet <CONFIG_TS>`** reads a Snaplet Seed `seed.config.ts` file.
+
+- Literal table names in its `select` array become `tables:` entries in the output.
+- A glob pattern (`"public.*"`) or an exclude entry (`"!archive*"`) cannot become a literal table list on its own. These are reported as notes instead, telling you to run `seedy init` and adjust the result by hand.
+- `--seed-ts <PATH>` also reads a `seed.ts` file, if you have one, and looks for `seed.<model>(...)` calls. These are Snaplet's custom per-row generator functions, arbitrary TypeScript, and cannot be mechanically converted. Every model with one is reported as needing manual review, listing which table it affects.
+- `--output <PATH>` sets where the converted file is written. Default `seedy.yaml`.
+
+**`seedy migrate neosync <JOB_JSON>`** reads a Neosync Job export, the JSON body returned by Neosync's `GetJob` API call. Neosync has no static config file on disk the way Snaplet does. Jobs live in Neosync's own database and are reached through its UI or API, so you need to export one first.
+
+- Each column mapping with a transformer becomes a `mask:` (and, where seedy has a matching generator, a `generator:`) entry.
+- Some transformers map exactly (an email transformer becomes `mask: fake, generator: email`; a SHA-256 hash transformer becomes `mask: hash`).
+- Some map approximately: seedy's closest strategy is used, but the shape will not match exactly (Neosync's categorical transformer picks from a fixed value set, which is not carried over). These are still written to the output, flagged with a note explaining the gap.
+- Custom code (JavaScript transformers, user-defined transformers) has no seedy equivalent and is reported as needing manual review, not written to the output.
+
+Neither converter touches a database. Both only read the input file and write a `seedy.yaml`. Run `seedy plan` against your actual database afterward to check the result matches your real schema before running `up`, `clone`, or `mask` with it.
 
 ## Masking
 
@@ -331,6 +358,7 @@ This detection is based on column name patterns only. It does not know what the 
 - `--root` subsetting only follows actual foreign key relationships. A table your application looks up outside of any foreign key is not discovered and stays empty on the target.
 - JSON and JSONB columns are masked or left alone as a whole column. seedy does not look inside a JSON value for PII in a nested field.
 - `mask` requires a primary key on any table it needs to touch (see [Masking](#masking)).
+- `migrate` cannot convert arbitrary custom code (Snaplet's `seed.ts` generator functions, Neosync's JavaScript/user-defined transformers). These are reported as needing manual review, not guessed at.
 - TLS support covers `sslmode=require`/`prefer` (encrypted, certificate not verified) and `disable` (plain). `verify-ca`/`verify-full` (full certificate chain and hostname verification) are not implemented yet and are rejected with a clear error rather than silently downgraded.
 
 ## Development
@@ -356,7 +384,6 @@ The test suite includes:
 
 Not built yet:
 
-- **Migration helpers** for teams moving from Snaplet or Neosync.
 - **Table aware sensitive field detection**, so a `name` column is treated differently on a `users` table versus an `organizations` table.
 - **Snapshot files.** `clone` currently needs a live connection to both the source and target database at once. A `snapshot` / `restore` split, where you extract once to a file and load it later without needing source access again, is not built.
 - **Full TLS certificate verification** (`verify-ca`/`verify-full`), for setups that need it rather than just an encrypted connection.

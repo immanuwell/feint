@@ -1,6 +1,6 @@
 # seedy
 
-A single binary for Postgres test data. Generate synthetic data from nothing, clone a real database with sensitive columns masked, or mask a database's own sensitive columns in place.
+A single binary for Postgres test data. Generate synthetic data from nothing, clone a real database with sensitive columns masked, mask a database's own sensitive columns in place, or migrate a config from another tool.
 
 No ORM. No config server. No Docker stack. It reads your schema and writes rows.
 
@@ -107,6 +107,8 @@ seedy up postgres://localhost/myapp
 **Clone**: `seedy clone`. Copies real rows from a source database to a target database, keeping keys intact and masking sensitive columns. Add `--root` to copy only a subset instead of the whole database.
 
 **Mask**: `seedy mask`. Rewrites a single database's own sensitive columns in place. No second database. This is the right tool when a database already got a full copy from somewhere else (a cloud snapshot restore, most commonly) and now needs its own PII scrubbed. Batched, resumable if interrupted, with a dry run and a confirmation step before it writes anything.
+
+**Migrate**: `seedy migrate snaplet` / `seedy migrate neosync`. Converts a Snaplet Seed or Neosync config into a starting `seedy.yaml`. Best effort, prints what converted and what needs a manual look.
 
 `clone` needs a live connection to both databases at once. There's no separate "snapshot to a file, restore it later" step yet. See `DOCS.md` for the full roadmap.
 

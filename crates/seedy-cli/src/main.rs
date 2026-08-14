@@ -95,6 +95,34 @@ enum Command {
         #[arg(long)]
         max_batches: Option<usize>,
     },
+    /// Convert another tool's config to seedy.yaml. Best effort — review the report before using the output.
+    Migrate {
+        #[command(subcommand)]
+        tool: MigrateTool,
+    },
+}
+
+#[derive(Subcommand)]
+enum MigrateTool {
+    /// Convert a Snaplet Seed `seed.config.ts` (and optionally `seed.ts`) to seedy.yaml.
+    Snaplet {
+        /// Path to seed.config.ts.
+        config_ts: std::path::PathBuf,
+        /// Path to seed.ts, if you have custom generators to detect.
+        #[arg(long)]
+        seed_ts: Option<std::path::PathBuf>,
+        /// Where to write the converted config.
+        #[arg(long, default_value = "seedy.yaml")]
+        output: std::path::PathBuf,
+    },
+    /// Convert a Neosync Job export (GetJob API response, JSON) to seedy.yaml.
+    Neosync {
+        /// Path to the Job export JSON.
+        job_json: std::path::PathBuf,
+        /// Where to write the converted config.
+        #[arg(long, default_value = "seedy.yaml")]
+        output: std::path::PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -146,5 +174,15 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
+        Command::Migrate { tool } => match tool {
+            MigrateTool::Snaplet {
+                config_ts,
+                seed_ts,
+                output,
+            } => commands::migrate::run_snaplet(&config_ts, seed_ts.as_deref(), &output).await,
+            MigrateTool::Neosync { job_json, output } => {
+                commands::migrate::run_neosync(&job_json, &output).await
+            }
+        },
     }
 }

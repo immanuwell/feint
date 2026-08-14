@@ -156,6 +156,7 @@ pub struct SanitizeSummary {
 /// run across multiple invocations, or for testing resume behavior
 /// against a genuinely partial, honestly-checkpointed run rather than a
 /// simulated one.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_sanitization(
     client: &mut Client,
     schema: &Schema,
