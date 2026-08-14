@@ -1,5 +1,7 @@
 # feint
 
+[![CI](https://github.com/immanuwell/feint/actions/workflows/ci.yml/badge.svg)](https://github.com/immanuwell/feint/actions/workflows/ci.yml)
+
 A single binary for Postgres test data. Generate synthetic data from nothing, clone a real database with sensitive columns masked, mask a database's own sensitive columns in place, or migrate a config from another tool.
 
 No ORM. No config server. No Docker stack. It reads your schema and writes rows.
@@ -105,9 +107,15 @@ That's a real, reproducible test run, not a marketing number. Clone the repo and
 
 ## Install
 
-You need Rust and Cargo. Get them from [rustup.rs](https://rustup.rs) if you don't have them.
+Linux and macOS, prebuilt binary:
 
-Build from source:
+```
+curl -fsSL https://raw.githubusercontent.com/immanuwell/feint/main/install.sh | sh
+```
+
+Installs to `~/.local/bin`. Set `FEINT_VERSION=vX.Y.Z` to pin a version instead of the latest release.
+
+Or build from source (needs Rust and Cargo, get them from [rustup.rs](https://rustup.rs)):
 
 ```
 git clone https://github.com/immanuwell/feint.git

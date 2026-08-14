@@ -18,7 +18,15 @@ Alongside the three modes, `feint migrate` converts another tool's config (Snapl
 
 ## Install
 
-Requirements: Rust and Cargo (get them from rustup.rs), and access to a Postgres database.
+On Linux or macOS, install the prebuilt binary:
+
+```
+curl -fsSL https://raw.githubusercontent.com/immanuwell/feint/main/install.sh | sh
+```
+
+This installs to `~/.local/bin`. Set `FEINT_VERSION=vX.Y.Z` before running it to pin a specific version instead of the latest release. Set `FEINT_INSTALL_DIR` to install somewhere else.
+
+Or build from source. Requirements: Rust and Cargo (get them from rustup.rs), and access to a Postgres database.
 
 ```
 git clone https://github.com/immanuwell/feint.git
@@ -385,6 +393,8 @@ The test suite includes:
 
 Not built yet:
 
+- **Homebrew tap.** A formula template exists at `packaging/homebrew/feint.rb`, but it needs a real release's checksums before it can go live. See `packaging/homebrew/README.md`.
+- **aarch64 Linux binaries.** The install script and release workflow currently cover x86_64 Linux, and both Intel and Apple Silicon macOS. arm64 Linux (e.g. AWS Graviton, Raspberry Pi) needs to build from source for now.
 - **Table aware sensitive field detection**, so a `name` column is treated differently on a `users` table versus an `organizations` table.
 - **Snapshot files.** `clone` currently needs a live connection to both the source and target database at once. A `snapshot` / `restore` split, where you extract once to a file and load it later without needing source access again, is not built.
 - **Full TLS certificate verification** (`verify-ca`/`verify-full`), for setups that need it rather than just an encrypted connection.
