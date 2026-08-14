@@ -2,8 +2,17 @@
 //! binary process (not per test — container startup dominates otherwise),
 //! with each test isolating itself into its own schema so tests can run
 //! concurrently without stepping on each other.
+//!
+//! Containers here are cached in `static`s so the whole binary reuses one
+//! (or two, for `CloneFixture`) instead of starting a fresh one per test.
+//! That means their `Drop` never runs — Rust never destructs `static`s at
+//! process exit — so `testcontainers`'s normal Drop-based cleanup can't
+//! reach them. [`register_for_cleanup`] tracks every container this binary
+//! starts, and the `#[dtor::dtor]` below force-removes all of them right
+//! before the process actually exits, via the `docker` CLI directly rather
+//! than through the (dropped, so unusable here) `ContainerAsync` handle.
 
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 use feint_core::config::FeintConfig;
 use feint_core::introspect::Schema;
@@ -13,6 +22,43 @@ use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
 use tokio::sync::OnceCell;
 use tokio_postgres::{Client, NoTls};
+
+static SPAWNED_CONTAINER_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Idempotent: every concurrent caller waiting on the same `OnceCell` sees
+/// the container once it's initialized and calls this, not just the one
+/// that ran the init closure, so duplicates here are expected and harmless
+/// to skip.
+fn register_for_cleanup(id: &str) {
+    let mut ids = SPAWNED_CONTAINER_IDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !ids.iter().any(|existing| existing == id) {
+        ids.push(id.to_string());
+    }
+}
+
+/// Runs once, right before this test binary's process actually exits.
+/// Synchronous and shells out to the `docker` CLI rather than using
+/// `ContainerAsync`'s own (async, Drop-driven) removal path, since nothing
+/// here is reachable through a normal `Drop` in the first place.
+///
+/// # Safety
+/// Only touches a `Mutex<Vec<String>>` and spawns a child process via
+/// `std::process::Command`, neither of which relies on any Rust runtime
+/// state (allocator, thread-locals, async executor) that `dtor` warns may
+/// not be available this late in process teardown.
+#[dtor::dtor]
+unsafe fn remove_containers_leaked_by_statics() {
+    let ids = SPAWNED_CONTAINER_IDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for id in ids.iter() {
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", id])
+            .output();
+    }
+}
 
 static CONTAINER: OnceCell<ContainerAsync<Postgres>> = OnceCell::const_new();
 static PORT: OnceLock<u16> = OnceLock::new();
@@ -33,6 +79,7 @@ async fn shared_port() -> u16 {
                 .expect("start postgres testcontainer (is Docker running?)")
         })
         .await;
+    register_for_cleanup(container.id());
     let port = container
         .get_host_port_ipv4(5432)
         .await
@@ -180,6 +227,7 @@ async fn start_container(
                 .expect("start postgres testcontainer (is Docker running?)")
         })
         .await;
+    register_for_cleanup(c.id());
     let port = c.get_host_port_ipv4(5432).await.expect("mapped port");
     let _ = port_cache.set(port);
     port

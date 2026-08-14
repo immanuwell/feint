@@ -40,3 +40,4 @@ testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["postgres"] }
 rstest = "0.23"
 assert_cmd = "2"
+dtor = "1"

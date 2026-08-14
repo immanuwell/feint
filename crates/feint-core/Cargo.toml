@@ -35,3 +35,4 @@ testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 rstest = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util"] }
+dtor = { workspace = true }
