@@ -83,6 +83,18 @@ pub async fn run(
 ) -> Result<RunSummary> {
     txn.batch_execute("SET CONSTRAINTS ALL DEFERRED").await?;
 
+    // Every table at least one foreign key points at, schema-wide. A
+    // `Simple` table outside this set can never be sampled from — a
+    // `Backfill`/`Deferred` table is always in it by construction (that's
+    // what makes it part of a cycle) — so it can skip `RETURNING` and
+    // `ref_pool` registration entirely and take the faster `COPY` path
+    // instead of chunked `INSERT`. See `copy.rs`.
+    let referenced_tables: HashSet<TableId> = schema
+        .tables
+        .iter()
+        .flat_map(|t| t.foreign_keys.iter().map(|fk| fk.ref_table.clone()))
+        .collect();
+
     let mut ref_pool = RefPool::default();
     let mut rows_by_table = Vec::new();
     let mut total_rows = 0u64;
@@ -103,6 +115,7 @@ pub async fn run(
                     config,
                     &HashSet::new(),
                     &mut ref_pool,
+                    referenced_tables.contains(table_id),
                 )
                 .await?;
                 progress(ProgressEvent::TableFinished {
@@ -399,6 +412,13 @@ fn register_returned(
     }
 }
 
+/// `is_referenced` should be true if any table's foreign key points at
+/// this one, anywhere in the schema. When it's false, nothing will ever
+/// sample this table's rows from the `ref_pool`, so there's no need to
+/// pay for `RETURNING` and registration at all — this table takes the
+/// `COPY` path instead of chunked `INSERT`, which is the whole point:
+/// this is exactly the case a high-volume padding/leaf table (events,
+/// logs, line items) hits in practice.
 pub(crate) async fn insert_plain_table(
     txn: &Transaction<'_>,
     table: &Table,
@@ -406,6 +426,7 @@ pub(crate) async fn insert_plain_table(
     config: &FeintConfig,
     skip_fk_columns: &HashSet<String>,
     ref_pool: &mut RefPool,
+    is_referenced: bool,
 ) -> Result<u64> {
     let empty = std::collections::BTreeMap::new();
     let overrides = config
@@ -428,9 +449,14 @@ pub(crate) async fn insert_plain_table(
         )?);
     }
 
-    let returning = returning_columns(table);
-    let returned = execute_batched_insert(txn, table, &columns, &rows, &returning, false).await?;
-    register_returned(ref_pool, table, &returning, &returned);
+    if is_referenced {
+        let returning = returning_columns(table);
+        let returned =
+            execute_batched_insert(txn, table, &columns, &rows, &returning, false).await?;
+        register_returned(ref_pool, table, &returning, &returned);
+    } else {
+        crate::copy::copy_rows(txn, table, &columns, &rows).await?;
+    }
     Ok(rows.len() as u64)
 }
 

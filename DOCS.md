@@ -561,6 +561,17 @@ feint resolves these in one of three ways, in this order:
 
 This applies the same way in `clone`. The only difference is which value gets written: `up` writes a freshly generated value, `clone` writes the real (or masked) value it already read from source.
 
+## Bulk loading
+
+`up`, `clone`, and `restore` all write rows through Postgres's `COPY ... FROM STDIN` protocol wherever they can, instead of chunked, parameterized `INSERT` statements. `COPY` has no per-statement bind-parameter ceiling and no per-row statement-planning overhead, which is what actually gets in the way of a large run: the old `INSERT` path capped out at a few hundred rows per statement, needing hundreds or thousands of round trips for anything past the tens of thousands of rows.
+
+Two things `COPY` cannot do, so these fall back to the older `INSERT` path automatically, no configuration needed:
+
+- **`RETURNING`.** GENERATE mode needs the database-assigned value back for any table another table's foreign key might sample (see [How generation works](#how-generation-works) above): feint works out schema-wide which tables that is once per run, and only tables nothing references take the `COPY` path. A table with a lot of configured `rows:` that nothing else in the schema points at (an events table, a log table, an activity feed) is exactly the case this is for.
+- **`OVERRIDING SYSTEM VALUE`.** `clone` and `restore` need this to preserve a real `GENERATED ALWAYS AS IDENTITY` value from the source rather than letting Postgres assign a new one. A table with this kind of column keeps using `INSERT`; every other `clone`/`restore` table uses `COPY`.
+
+Verified directly, not just claimed: an integration test clones, generates, and restores 20,000 rows through each of these paths and checks every row landed with the correct value, well past the point the old chunked `INSERT` path would have needed 40-plus separate statements. This is a real, measured number, not "millions" rounded up. The whole run is still one transaction with every row held in memory before any write, so this removes the per-statement ceiling, not the memory one. A genuinely unbounded, constant-memory streaming run is a further step, not built yet.
+
 ## Supported Postgres features
 
 | Feature | Support |
@@ -570,7 +581,7 @@ This applies the same way in `clone`. The only difference is which value gets wr
 | Foreign key cycles | Yes, see above |
 | Enums | Yes, picks a random declared value |
 | Domains | Yes, generates a value for the underlying base type |
-| Arrays | Yes, generates a short array of the element type |
+| Arrays | Yes, generates a short array of the element type. Reading an array back out of Postgres (`clone`, `mask`) round-trips correctly in both text and binary wire format |
 | JSONB and JSON | Yes, generates a small JSON object |
 | UUID primary keys | Yes, generated client side so `--seed` stays reproducible even when the column has a `DEFAULT gen_random_uuid()` |
 | Serial and identity columns | Yes. `up` leaves them for Postgres to assign, then reads the result back. `clone` preserves the source's real value instead, and resyncs the target's sequence afterward so the next unrelated insert does not collide |
@@ -591,9 +602,9 @@ This detection is based on column name patterns only. It does not know what the 
 
 - CHECK constraints are not validated before insert. feint relies on the transaction rolling back cleanly if one fails.
 - Composite types (custom `CREATE TYPE ... AS (...)` structs) have no generator yet.
-- citext, inet, and cidr columns use a generic fallback rather than a purpose built generator.
+- citext, inet, and cidr columns use a generic fallback rather than a purpose built generator. Reading one of these back out of Postgres (via `clone` or `mask`) round-trips correctly when the driver requests text format, but not when it requests binary, a real, currently unfixed gap. (An *array* of any type, including these, round-trips correctly in both formats regardless: its own binary envelope is decoded properly, and each element then goes through this same per-element logic, so only the scalar case above is affected.)
 - The column name heuristic does not know what a table represents, only the column name.
-- The whole run is one transaction. This is correct and safe, but it is not built for generating or cloning millions of rows yet.
+- The whole run is still one transaction, that part is unchanged, and still not built around constant memory for an unbounded row count (rows are fully materialized before any write). What changed: bulk loading uses `COPY` instead of chunked, parameterized `INSERT` wherever nothing needs `RETURNING` or `OVERRIDING SYSTEM VALUE` (`clone`, `restore`, and any `up`/generate-strategy table nothing else references), removing the old few-hundred-rows-per-statement ceiling entirely for that path. A table `up` needs `RETURNING` for (because something else references it), and a `clone`/`restore` table with a `GENERATED ALWAYS AS IDENTITY` column, still use the older chunked-`INSERT` path, unchanged.
 - There is no way to avoid duplicate data on a second `up` or `clone` run against the same tables. Truncate the target first if you want a clean set.
 - `clone` does not create tables on the target. The target schema must already exist and match the source.
 - `--root` subsetting only follows actual foreign key relationships. A table your application looks up outside of any foreign key is not discovered and stays empty on the target.
@@ -618,7 +629,7 @@ cargo fmt
 
 The test suite includes:
 
-- Unit tests for the value encoding, the dependency graph, the generators, and the masking transform.
+- Unit tests for the value encoding, the dependency graph, the generators, the masking transform, and `COPY` text-format encoding (escaping, NULL, every `PgValue` variant, including the array-braces-pass-through and doubled-backslash-in-bytea cases).
 - Integration tests that create real schemas in a throwaway Postgres container and check the results: composite keys, cycles, enums, arrays, JSONB, citext, partitioned tables, and more.
 - Integration tests with two containers (source and target) for `clone`: key preservation, sequence resync, each masking strategy, the rules that reject unsafe masking configs, and subsetting (a diamond dependency, a self-referencing root, a cap abort).
 - `hybrid_clone`, for `strategy: generate`: synthetic rows padded to the configured `rows:` while correctly referencing real, already-masked parent rows (verified via an actual FK-constrained Postgres commit, not just a row count), a generate-strategy table's real source row proven unread, both hybrid validation rejections (a mask table pointing at a generate table, and mixed strategy inside one FK cycle), and composition with `--root` subsetting.
@@ -630,6 +641,7 @@ The test suite includes:
 - `verify_masking`, which confirms the post-mask verification pass stays quiet after a real, correct mask run, then corrupts the masked data directly (a broken hash, a non-redacted value, every row's fake value collapsed to one) and confirms verification catches each one specifically.
 - `classify_mode`, which checks the classification report and lockfile diff against a real database: sensitive columns detected, key columns excluded, a new column showing up as drift, and an explicit `mask: none` override on a sensitive-looking column being visible in the report rather than silently disappearing. The smoke test also runs the full `feint classify --write` / `--check` / `mask --strict` cycle through the real compiled binary, including the refuse-then-succeed sequence around a drifted column.
 - `snapshot_restore`, which proves the whole point of the split: a snapshot captured from a source container round-trips through a real file on disk, and `restore` never touches the source connection again after `capture` returns (the smoke test goes further and destroys the source container entirely between `snapshot` and `restore`). Also covers a foreign-key cycle surviving the round trip, `strategy: generate` rejected at capture time, `--root` composing with a snapshot, and a schema that drifted between capture and restore being rejected rather than guessed at.
+- `copy_volume`, which round-trips 20,000 rows through `clone`, `up` (an unreferenced leaf table), and `restore`, checking a full-column checksum and a specific sampled row rather than just a count, plus a dedicated test that writes a real array column containing tabs, newlines, backslashes, and non-ASCII text through `clone`'s `COPY` path and reads the exact values back from Postgres. That second test is what caught a real, pre-existing bug: `PgValue`'s `FromSql` had no explicit handling for the binary array wire format and was silently corrupting any array column read back when the driver requested binary rather than text, now fixed (see [Supported Postgres features](#supported-postgres-features)).
 
 ## Roadmap
 
@@ -639,6 +651,8 @@ Not built yet:
 - **aarch64 Linux binaries.** The install script and release workflow currently cover x86_64 Linux, and both Intel and Apple Silicon macOS. arm64 Linux (e.g. AWS Graviton, Raspberry Pi) needs to build from source for now.
 - **Table aware sensitive field detection**, so a `name` column is treated differently on a `users` table versus an `organizations` table.
 - **Full TLS certificate verification** (`verify-ca`/`verify-full`), for setups that need it rather than just an encrypted connection.
+- **Constant-memory streaming.** [Bulk loading](#bulk-loading) removed the per-statement row ceiling, but a run still materializes every row in memory before writing any of it. True streaming (read, mask/generate, and write one row at a time) would remove the memory ceiling too.
+- **Distribution and cardinality shape.** Real tables have a long-tail row distribution (some users have 1 order, a few have hundreds), not a uniform count per parent. Nothing in feint controls this yet.
 
 ## License
 

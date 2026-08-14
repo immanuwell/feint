@@ -2,6 +2,7 @@ pub mod classify;
 pub mod clone;
 pub mod config;
 pub mod connect;
+mod copy;
 pub mod error;
 pub mod generate;
 pub mod graph;

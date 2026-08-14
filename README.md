@@ -107,6 +107,8 @@ Nasty Postgres schema correctness check
 
 That's a real, reproducible test run, not a marketing number. Clone the repo and run the command yourself (needs Docker). See [Supported Postgres features](DOCS.md#supported-postgres-features) for what each case covers and why it's there.
 
+This demo proves correctness across schema shapes, not volume. For that, `up`, `clone`, and `restore` write through Postgres's `COPY` protocol wherever nothing needs `RETURNING` or `OVERRIDING SYSTEM VALUE`, instead of chunked `INSERT` statements capped at a few hundred rows each. A separate test round-trips 20,000 rows through each path and checks every one landed correctly. See [Bulk loading](DOCS.md#bulk-loading).
+
 ## Install
 
 Linux and macOS, prebuilt binary:

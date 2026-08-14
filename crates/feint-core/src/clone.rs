@@ -18,7 +18,7 @@ use tokio_postgres::Transaction;
 use crate::config::{FeintConfig, TableStrategy};
 use crate::error::{FeintError, Result};
 use crate::graph::{FkRef, InsertGroup, InsertPlan};
-use crate::insert::{self, execute_batched_insert, sql_cast_type, RefPool};
+use crate::insert::{self, sql_cast_type, RefPool};
 use crate::introspect::{Column, Identity, Schema, Table, TableId};
 use crate::mask::{self, validate_masking_config};
 use crate::subset::SubsetRows;
@@ -308,6 +308,17 @@ pub async fn run(
     // its own FK resolution, reused here rather than reimplemented.
     let mut ref_pool = RefPool::default();
 
+    // A `generate`-strategy `Simple` table nothing references can skip
+    // `RETURNING`/`ref_pool` registration and take the `COPY` path — same
+    // reasoning as `insert.rs::run`. A `Deferred`/`Backfill` table is
+    // always referenced by construction (that's what makes it cyclic), so
+    // this set only ever matters for the `Simple` case below.
+    let referenced_tables: HashSet<TableId> = schema
+        .tables
+        .iter()
+        .flat_map(|t| t.foreign_keys.iter().map(|fk| fk.ref_table.clone()))
+        .collect();
+
     let mut rows_by_table = Vec::new();
     let mut total_rows = 0u64;
 
@@ -338,6 +349,7 @@ pub async fn run(
                             config,
                             &HashSet::new(),
                             &mut ref_pool,
+                            referenced_tables.contains(table_id),
                         )
                         .await?
                     }
@@ -461,7 +473,7 @@ async fn clone_table_full(
     let rows = mask_rows(table, &columns, rows, config)?;
     register_rows_in_ref_pool(ref_pool, table, &columns, &rows);
     let overriding = needs_overriding_system_value(&columns);
-    execute_batched_insert(target_txn, table, &columns, &rows, &[], overriding).await?;
+    crate::copy::bulk_insert_no_returning(target_txn, table, &columns, &rows, overriding).await?;
     resync_sequences(target_txn, table, &columns, &rows).await?;
     Ok(rows.len() as u64)
 }
@@ -523,7 +535,14 @@ async fn clone_backfill_group(
             .collect();
 
         let overriding = needs_overriding_system_value(&columns);
-        execute_batched_insert(target_txn, table, &columns, &insert_rows, &[], overriding).await?;
+        crate::copy::bulk_insert_no_returning(
+            target_txn,
+            table,
+            &columns,
+            &insert_rows,
+            overriding,
+        )
+        .await?;
         resync_sequences(target_txn, table, &columns, &full_rows).await?;
 
         progress(ProgressEvent::TableFinished {

@@ -29,7 +29,7 @@ use crate::clone::{self, table_strategy};
 use crate::config::{FeintConfig, TableStrategy};
 use crate::error::{FeintError, Result};
 use crate::graph::InsertGroup;
-use crate::insert::{execute_batched_insert, sql_cast_type};
+use crate::insert::sql_cast_type;
 use crate::introspect::{Column, Schema, Table, TableId};
 use crate::mask::validate_masking_config;
 use crate::subset::SubsetRows;
@@ -290,7 +290,7 @@ async fn restore_table(
     let columns = clone::clone_supplied_columns(table);
     let rows = reindex_rows(&table.id.qualified(), &snap.columns, &columns, &snap.rows)?;
     let overriding = clone::needs_overriding_system_value(&columns);
-    execute_batched_insert(target_txn, table, &columns, &rows, &[], overriding).await?;
+    crate::copy::bulk_insert_no_returning(target_txn, table, &columns, &rows, overriding).await?;
     clone::resync_sequences(target_txn, table, &columns, &rows).await?;
     Ok(rows.len() as u64)
 }
@@ -341,7 +341,14 @@ async fn restore_backfill_group(
             .collect();
 
         let overriding = clone::needs_overriding_system_value(&columns);
-        execute_batched_insert(target_txn, table, &columns, &insert_rows, &[], overriding).await?;
+        crate::copy::bulk_insert_no_returning(
+            target_txn,
+            table,
+            &columns,
+            &insert_rows,
+            overriding,
+        )
+        .await?;
         clone::resync_sequences(target_txn, table, &columns, &full_rows).await?;
 
         results.push((table_id.qualified(), full_rows.len() as u64));
