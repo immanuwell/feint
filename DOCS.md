@@ -75,7 +75,7 @@ If a `feint.yaml` file exists at the given `--config` path, `plan` uses its row 
 ### feint up
 
 ```
-feint up <DATABASE_URL> [--config <PATH>] [--seed <SEED>] [--schema <NAME>]...
+feint up <DATABASE_URL> [--config <PATH>] [--seed <SEED>] [--schema <NAME>]... [--profile <PATH>]
 ```
 
 Generates data and inserts it.
@@ -83,10 +83,25 @@ Generates data and inserts it.
 - `--config <PATH>` sets which config file to read. Default is `feint.yaml`.
 - `--seed <SEED>` overrides the seed value from the config file for this run.
 - `--schema <NAME>` sets which schema to read, same as `init` and `plan`.
+- `--profile <PATH>` reads a file written by `feint profile` and generates against its captured shape (row counts, null rates, per-parent child-row distribution) instead of uniform defaults. See [Profile-driven generation](#profile-driven-generation).
 
 The whole run happens inside one database transaction. If any row fails to insert, for example a CHECK constraint rejects a generated value, the entire transaction rolls back. Nothing is left half-written.
 
 On success, `up` prints the total row count, the time taken, and confirms that constraints and foreign keys were satisfied.
+
+### feint profile
+
+```
+feint profile <DATABASE_URL> --output <PATH> [--schema <NAME>]...
+```
+
+Captures a statistical shape from a real database: row counts, per-column null rates, and per-foreign-key cardinality (how many child rows each parent row has). Writes it to a file for `up --profile` to generate against later. Only ever runs aggregate `SELECT`s (`count(*)`, `count(*) FILTER (...)`, `GROUP BY` on join keys); no row's actual data ever leaves the database, only counts and ratios.
+
+- `<DATABASE_URL>` is only ever queried with aggregate `SELECT`s.
+- `--output <PATH>` sets where the profile file is written.
+- `--schema <NAME>` sets which schema(s) to profile.
+
+See [Profile-driven generation](#profile-driven-generation) for what gets captured, what it's used for, and what's deliberately out of scope.
 
 ### feint clone
 
@@ -572,6 +587,32 @@ Two things `COPY` cannot do, so these fall back to the older `INSERT` path autom
 
 Verified directly, not just claimed: an integration test clones, generates, and restores 20,000 rows through each of these paths and checks every row landed with the correct value, well past the point the old chunked `INSERT` path would have needed 40-plus separate statements. This is a real, measured number, not "millions" rounded up. The whole run is still one transaction with every row held in memory before any write, so this removes the per-statement ceiling, not the memory one. A genuinely unbounded, constant-memory streaming run is a further step, not built yet.
 
+## Profile-driven generation
+
+A uniform `rows:` count per table means a uniform number of children per parent: with `orders: rows: 500` and `users: rows: 100`, every user ends up with roughly 5 orders. Production never looks like that. Most users have one or two orders; a handful have hundreds. That shape, not just the total row count, is what tends to change which query plan Postgres picks, which is exactly the thing a uniform synthetic dataset gets wrong.
+
+`feint profile` captures that shape from a real database, and `up --profile` generates against it instead of a flat count:
+
+```
+feint profile postgres://prod-host/myapp --output prod.profile.yaml
+feint up postgres://localhost/myapp_dev --profile prod.profile.yaml
+```
+
+Three things get captured, per table:
+
+- **Row count.** Used as the default `rows:` for a table you haven't explicitly configured in `feint.yaml`. An explicit `rows:` still wins over the profile; the profile only fills in what you didn't set.
+- **Null rate**, per nullable column. `up` rolls a weighted coin for that column on every row instead of never generating NULL.
+- **Cardinality**, per foreign key: the real distribution of "how many child rows does each parent have," captured as a histogram (`count(*) FILTER`/`GROUP BY` on the join, not a peek at any row's actual data). At generate time, `up` visits each of the parent table's rows once, draws a child count from that histogram, and generates exactly that many child rows pointing at it, instead of sampling a random parent independently per child row. The result: a real long tail, not a bell curve around the mean.
+
+Scope, on purpose:
+
+- Cardinality is only captured (and only used) for a **single-column** foreign key referencing a **single-column** unique/primary key. A composite key is skipped, not approximated.
+- If a table has more than one foreign key with a captured profile, the first one (in the table's own foreign-key order) drives the row count and distribution; any other foreign key on that table still gets an ordinary per-row random sample, same as without a profile.
+- Enum and boolean value frequencies (`status: active 60%, pending 30%, cancelled 10%` instead of an even split across declared variants) are not captured yet: a natural next step, not built.
+- `feint plan`'s row-count estimate does not read a profile; it always shows the flat `rows:`/default count, even for a table you intend to run with `--profile`.
+- Nothing sensitive ever leaves the source database. Every value written to the profile file is a count or a ratio; no row's actual column value is ever read for this.
+- A profile is matched to a table by schema-qualified name, the same way `feint.yaml`'s `tables:` keys are. Capture and generate should point at databases with the same schema (same table and column names), the normal case for this feature (a production source, a dev/staging target).
+
 ## Supported Postgres features
 
 | Feature | Support |
@@ -615,6 +656,8 @@ This detection is based on column name patterns only. It does not know what the 
 - `feint snapshot` does not support a `strategy: generate` table (see [Hybrid clone](#hybrid-clone-mask--generate-in-one-run)); it rejects the config rather than only capturing part of a hybrid run.
 - A snapshot file is feint's own versioned format, meant only for a later `feint restore` by a compatible feint build. It is not a portable interchange format, and a file from a newer feint version than the one running `restore` is rejected rather than misread.
 - TLS support covers `sslmode=require`/`prefer` (encrypted, certificate not verified) and `disable` (plain). `verify-ca`/`verify-full` (full certificate chain and hostname verification) are not implemented yet and are rejected with a clear error rather than silently downgraded.
+- **A table where every column is server-assigned** (a serial/identity primary key and literally nothing else) silently generates zero rows through `up` or `clone`, while still reporting the row count as if they were written. Found while testing [Profile-driven generation](#profile-driven-generation); genuinely rare in practice (most tables have at least one other column) but real, and not fixed yet. A table like this needs a real column added to work around it for now.
+- Cardinality profiling (see [Profile-driven generation](#profile-driven-generation)) only covers single-column foreign keys, and `feint plan`'s row estimate doesn't read a profile.
 
 ## Development
 
@@ -642,6 +685,7 @@ The test suite includes:
 - `classify_mode`, which checks the classification report and lockfile diff against a real database: sensitive columns detected, key columns excluded, a new column showing up as drift, and an explicit `mask: none` override on a sensitive-looking column being visible in the report rather than silently disappearing. The smoke test also runs the full `feint classify --write` / `--check` / `mask --strict` cycle through the real compiled binary, including the refuse-then-succeed sequence around a drifted column.
 - `snapshot_restore`, which proves the whole point of the split: a snapshot captured from a source container round-trips through a real file on disk, and `restore` never touches the source connection again after `capture` returns (the smoke test goes further and destroys the source container entirely between `snapshot` and `restore`). Also covers a foreign-key cycle surviving the round trip, `strategy: generate` rejected at capture time, `--root` composing with a snapshot, and a schema that drifted between capture and restore being rejected rather than guessed at.
 - `copy_volume`, which round-trips 20,000 rows through `clone`, `up` (an unreferenced leaf table), and `restore`, checking a full-column checksum and a specific sampled row rather than just a count, plus a dedicated test that writes a real array column containing tabs, newlines, backslashes, and non-ASCII text through `clone`'s `COPY` path and reads the exact values back from Postgres. That second test is what caught a real, pre-existing bug: `PgValue`'s `FromSql` had no explicit handling for the binary array wire format and was silently corrupting any array column read back when the driver requested binary rather than text, now fixed (see [Supported Postgres features](#supported-postgres-features)).
+- `profile_mode`, which captures a deliberately skewed distribution (one parent with 50 children among 19 with exactly 1 each) from a real database and confirms `up --profile` reproduces that exact shape (never a count the source distribution didn't actually have), a captured null rate landing within a statistical tolerance band at n=500, the profile's row count winning as the default for an unconfigured table but losing to an explicit `rows:`, and the same profile-driven run producing an identical total both times it's run.
 
 ## Roadmap
 
@@ -652,7 +696,6 @@ Not built yet:
 - **Table aware sensitive field detection**, so a `name` column is treated differently on a `users` table versus an `organizations` table.
 - **Full TLS certificate verification** (`verify-ca`/`verify-full`), for setups that need it rather than just an encrypted connection.
 - **Constant-memory streaming.** [Bulk loading](#bulk-loading) removed the per-statement row ceiling, but a run still materializes every row in memory before writing any of it. True streaming (read, mask/generate, and write one row at a time) would remove the memory ceiling too.
-- **Distribution and cardinality shape.** Real tables have a long-tail row distribution (some users have 1 order, a few have hundreds), not a uniform count per parent. Nothing in feint controls this yet.
 
 ## License
 

@@ -51,6 +51,23 @@ enum Command {
         /// Schema(s) to introspect. Repeat to include more than one.
         #[arg(long = "schema", default_value = "public")]
         schemas: Vec<String>,
+        /// A file written by `feint profile`: generate row counts, null rates, and per-parent
+        /// child counts matching a real database's captured shape instead of a uniform default.
+        #[arg(long)]
+        profile: Option<std::path::PathBuf>,
+    },
+    /// Capture row counts, null rates, and foreign-key cardinality from a real database for
+    /// `up --profile` to generate against. Reads only aggregate counts and ratios, never a row's
+    /// actual values.
+    Profile {
+        /// Postgres connection URL to profile. Only ever queried with aggregate SELECTs.
+        database_url: String,
+        /// Where to write the profile file.
+        #[arg(long)]
+        output: std::path::PathBuf,
+        /// Schema(s) to introspect. Repeat to include more than one.
+        #[arg(long = "schema", default_value = "public")]
+        schemas: Vec<String>,
     },
     /// Clone a database, preserving keys and masking sensitive columns.
     Clone {
@@ -242,7 +259,13 @@ async fn main() -> anyhow::Result<()> {
             config,
             seed,
             schemas,
-        } => commands::up::run(&database_url, &config, seed, &schemas).await,
+            profile,
+        } => commands::up::run(&database_url, &config, seed, &schemas, profile.as_deref()).await,
+        Command::Profile {
+            database_url,
+            output,
+            schemas,
+        } => commands::profile::run(&database_url, &output, &schemas).await,
         Command::Clone {
             source_url,
             target_url,

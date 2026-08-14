@@ -2,21 +2,25 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use feint_core::config::FeintConfig;
+use feint_core::profile::ProfileFile;
 use feint_core::{graph, insert, introspect};
 use indicatif::MultiProgress;
 
 use crate::ui;
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     database_url: &str,
     config_path: &Path,
     seed_override: Option<String>,
     schemas: &[String],
+    profile_path: Option<&Path>,
 ) -> anyhow::Result<()> {
     let mut config = FeintConfig::load(config_path)?;
     if let Some(seed) = seed_override {
         config.seed = seed;
     }
+    let profile = profile_path.map(ProfileFile::read_from_file).transpose()?;
 
     let mut client = feint_core::connect::connect(database_url).await?;
 
@@ -33,22 +37,30 @@ pub async fn run(
     let multi = MultiProgress::new();
     let mut bars: HashMap<String, indicatif::ProgressBar> = HashMap::new();
 
-    let run_result = insert::run(&txn, &schema, &plan, &config, |event| match event {
-        insert::ProgressEvent::TableStarted {
-            table,
-            planned_rows,
-        } => {
-            let bar = multi.add(ui::table_bar(table, planned_rows as u64));
-            bars.insert(table.to_string(), bar);
-        }
-        insert::ProgressEvent::TableFinished { table, rows } => {
-            if let Some(bar) = bars.get(table) {
-                bar.set_position(rows);
-                bar.finish();
-            }
-        }
-    })
-    .await;
+    let run_result =
+        insert::run(
+            &txn,
+            &schema,
+            &plan,
+            &config,
+            profile.as_ref(),
+            |event| match event {
+                insert::ProgressEvent::TableStarted {
+                    table,
+                    planned_rows,
+                } => {
+                    let bar = multi.add(ui::table_bar(table, planned_rows as u64));
+                    bars.insert(table.to_string(), bar);
+                }
+                insert::ProgressEvent::TableFinished { table, rows } => {
+                    if let Some(bar) = bars.get(table) {
+                        bar.set_position(rows);
+                        bar.finish();
+                    }
+                }
+            },
+        )
+        .await;
 
     let summary = match run_result {
         Ok(s) => s,

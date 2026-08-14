@@ -159,6 +159,8 @@ feint up postgres://localhost/myapp
 
 **Snapshot**: `feint snapshot` / `feint restore`. Captures a `clone`-shaped, masked read of a database into a file, then loads that file into a target database later, no live connection back to the source needed at restore time. Build one snapshot, restore it into as many throwaway databases as you want: a CI job per PR, a contractor's laptop, an air-gapped environment. See `DOCS.md` for the full roadmap.
 
+**Profile**: `feint profile` / `up --profile`. Captures row counts, null rates, and per-parent child-row cardinality from a real database (aggregate queries only, no row values read), then `up --profile` generates against that shape instead of a uniform default, so a dev database gets the same long-tail distributions the real one has. See [Profile-driven generation](DOCS.md#profile-driven-generation).
+
 ## Full docs
 
 See [DOCS.md](DOCS.md) for the complete command reference, the `feint.yaml` format, supported Postgres features, and known limitations.

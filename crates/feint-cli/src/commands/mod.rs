@@ -5,6 +5,7 @@ pub mod mask;
 pub mod migrate;
 pub mod plan;
 pub mod policy;
+pub mod profile;
 pub mod restore;
 pub mod snapshot;
 pub mod up;

@@ -143,7 +143,7 @@ impl TestDb {
         let config = feint_test_config(schema, rows);
         let plan = graph::plan_insertion(schema).expect("insertion plan");
         let txn = self.client.transaction().await.expect("begin txn");
-        let summary = insert::run(&txn, schema, &plan, &config, |_| {})
+        let summary = insert::run(&txn, schema, &plan, &config, None, |_| {})
             .await
             .expect("feint up run");
         txn.commit().await.expect("commit");

@@ -72,6 +72,15 @@ impl RefPool {
         let idx = rng.gen_range(0..pool.len());
         Some(pool[idx].clone())
     }
+
+    /// Every tuple registered for `(table, columns)`, in registration
+    /// order. Used for profile-driven cardinality generation, which needs
+    /// to visit each parent row exactly once (to decide its own number of
+    /// children) rather than sampling one at random.
+    pub(crate) fn all(&self, table: &TableId, columns: &[String]) -> &[Vec<PgValue>] {
+        let key = (table.clone(), columns.to_vec());
+        self.pools.get(&key).map(Vec::as_slice).unwrap_or(&[])
+    }
 }
 
 pub async fn run(
@@ -79,6 +88,7 @@ pub async fn run(
     schema: &Schema,
     plan: &InsertPlan,
     config: &FeintConfig,
+    profile: Option<&crate::profile::ProfileFile>,
     mut progress: impl FnMut(ProgressEvent),
 ) -> Result<RunSummary> {
     txn.batch_execute("SET CONSTRAINTS ALL DEFERRED").await?;
@@ -103,21 +113,38 @@ pub async fn run(
         match group {
             InsertGroup::Simple(table_id) => {
                 let table = schema.table(table_id).expect("table exists in schema");
-                let planned_rows = rows_for(config, table_id);
                 progress(ProgressEvent::TableStarted {
                     table: &table_id.qualified(),
-                    planned_rows,
+                    planned_rows: rows_for(config, table_id, profile),
                 });
-                let n = insert_plain_table(
-                    txn,
-                    table,
-                    planned_rows,
-                    config,
-                    &HashSet::new(),
-                    &mut ref_pool,
-                    referenced_tables.contains(table_id),
-                )
-                .await?;
+                let n = match cardinality_driving_fk(table, profile) {
+                    Some((fk, cardinality)) => {
+                        insert_plain_table_with_cardinality(
+                            txn,
+                            table,
+                            fk,
+                            cardinality,
+                            config,
+                            profile,
+                            &mut ref_pool,
+                            referenced_tables.contains(table_id),
+                        )
+                        .await?
+                    }
+                    None => {
+                        insert_plain_table(
+                            txn,
+                            table,
+                            rows_for(config, table_id, profile),
+                            config,
+                            profile,
+                            &HashSet::new(),
+                            &mut ref_pool,
+                            referenced_tables.contains(table_id),
+                        )
+                        .await?
+                    }
+                };
                 progress(ProgressEvent::TableFinished {
                     table: &table_id.qualified(),
                     rows: n,
@@ -131,6 +158,7 @@ pub async fn run(
                     schema,
                     tables,
                     config,
+                    profile,
                     &mut ref_pool,
                     &mut progress,
                 )
@@ -150,6 +178,7 @@ pub async fn run(
                     tables,
                     null_then_backfill,
                     config,
+                    profile,
                     &mut ref_pool,
                     &mut progress,
                 )
@@ -168,11 +197,24 @@ pub async fn run(
     })
 }
 
-pub(crate) fn rows_for(config: &FeintConfig, table_id: &TableId) -> u32 {
-    config
-        .table_config(&table_id.qualified())
-        .map(|t| t.rows)
-        .unwrap_or(crate::config::DEFAULT_ROWS)
+/// `rows:` from `feint.yaml` wins when a table is explicitly configured.
+/// Otherwise, a loaded profile's captured `row_count` (see `profile.rs`)
+/// is a better default than the fixed fallback — it's what the real
+/// database this profile came from actually had.
+pub(crate) fn rows_for(
+    config: &FeintConfig,
+    table_id: &TableId,
+    profile: Option<&crate::profile::ProfileFile>,
+) -> u32 {
+    if let Some(t) = config.table_config(&table_id.qualified()) {
+        return t.rows;
+    }
+    if let Some(row_count) = profile.and_then(|p| p.table(&table_id.qualified())) {
+        if row_count.row_count > 0 {
+            return row_count.row_count.min(u32::MAX as u64) as u32;
+        }
+    }
+    crate::config::DEFAULT_ROWS
 }
 
 fn supplied_columns(table: &Table) -> Vec<&Column> {
@@ -200,9 +242,50 @@ fn returning_columns(table: &Table) -> Vec<String> {
     cols
 }
 
+/// Finds the first foreign key on `table` that a loaded profile has a
+/// captured cardinality histogram for. That FK's parent row count drives
+/// how many rows of `table` get generated and how they're distributed —
+/// see `insert_plain_table_with_cardinality`. Any other FK on the same
+/// table still gets a per-row uniform sample from the `RefPool`, same as
+/// without a profile at all.
+fn cardinality_driving_fk<'a>(
+    table: &'a Table,
+    profile: Option<&'a crate::profile::ProfileFile>,
+) -> Option<(
+    &'a crate::introspect::ForeignKey,
+    &'a crate::profile::CardinalityProfile,
+)> {
+    let table_profile = profile?.table(&table.id.qualified())?;
+    table
+        .foreign_keys
+        .iter()
+        .find_map(|fk| table_profile.cardinality.get(&fk.name).map(|c| (fk, c)))
+}
+
+/// Weighted-random pick of a `children_count` from a cardinality
+/// histogram. Falls back to 0 if the histogram is somehow empty or every
+/// weight is zero — never panics, never fabricates a count the profile
+/// didn't actually observe.
+fn sample_cardinality(histogram: &[(u32, u64)], rng: &mut rand_chacha::ChaCha8Rng) -> u32 {
+    let total: u64 = histogram.iter().map(|(_, weight)| *weight).sum();
+    if total == 0 {
+        return 0;
+    }
+    let mut roll = rng.gen_range(0..total);
+    for (count, weight) in histogram {
+        if roll < *weight {
+            return *count;
+        }
+        roll -= *weight;
+    }
+    histogram.last().map(|(count, _)| *count).unwrap_or(0)
+}
+
 /// Generate one row's values for `supplied_columns`, in order.
 /// `skip_fk_columns` names FK columns to leave NULL (Backfill first pass);
-/// pass `&HashSet::new()` for a plain insert.
+/// pass `&HashSet::new()` for a plain insert. `profile`, if loaded, rolls
+/// a deterministic weighted coin for any nullable column with a captured
+/// null fraction, instead of `generate_value`'s normal never-null default.
 #[allow(clippy::too_many_arguments)]
 fn generate_row(
     table: &Table,
@@ -212,6 +295,7 @@ fn generate_row(
     overrides: &std::collections::BTreeMap<String, crate::config::ColumnConfig>,
     skip_fk_columns: &HashSet<String>,
     ref_pool: &RefPool,
+    profile: Option<&crate::profile::ProfileFile>,
 ) -> Result<Vec<PgValue>> {
     let table_name = table.id.qualified();
     let mut values: HashMap<String, PgValue> = HashMap::new();
@@ -266,6 +350,10 @@ fn generate_row(
         }
     }
 
+    let null_fractions = profile
+        .and_then(|p| p.table(&table_name))
+        .map(|t| &t.null_fractions);
+
     for col in supplied {
         if values.contains_key(&col.name) {
             continue;
@@ -281,7 +369,24 @@ fn generate_row(
                 row_identity,
             },
         );
-        let value = generate_value(col, override_generator, &mut rng)?;
+        let null_fraction = if col.nullable {
+            null_fractions
+                .and_then(|f| f.get(&col.name))
+                .copied()
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        // Rolled from the same RNG stream, before generating the value —
+        // keeps the whole row deterministic per seed without a second
+        // `derive_rng` call, and a 0.0 fraction (the overwhelming common
+        // case: no profile, or a column the profile never saw NULL) never
+        // touches the RNG differently than before this feature existed.
+        let value = if null_fraction > 0.0 && rng.gen::<f64>() < null_fraction {
+            PgValue::Null
+        } else {
+            generate_value(col, override_generator, &mut rng)?
+        };
         values.insert(col.name.clone(), value);
     }
 
@@ -419,11 +524,13 @@ fn register_returned(
 /// `COPY` path instead of chunked `INSERT`, which is the whole point:
 /// this is exactly the case a high-volume padding/leaf table (events,
 /// logs, line items) hits in practice.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_plain_table(
     txn: &Transaction<'_>,
     table: &Table,
     planned_rows: u32,
     config: &FeintConfig,
+    profile: Option<&crate::profile::ProfileFile>,
     skip_fk_columns: &HashSet<String>,
     ref_pool: &mut RefPool,
     is_referenced: bool,
@@ -446,6 +553,7 @@ pub(crate) async fn insert_plain_table(
             overrides,
             skip_fk_columns,
             ref_pool,
+            profile,
         )?);
     }
 
@@ -460,12 +568,99 @@ pub(crate) async fn insert_plain_table(
     Ok(rows.len() as u64)
 }
 
+/// A `Simple`-group table whose first profiled foreign key already has
+/// its parent rows generated (guaranteed by topological order). Instead
+/// of a flat `planned_rows` count, visits each parent row once, draws a
+/// `children_count` from the captured histogram (deterministically, keyed
+/// on the parent's own index), and generates that many child rows
+/// pointing at it — the actual mechanism behind [`crate::profile`]'s
+/// whole reason to exist: a long tail instead of a uniform count.
+#[allow(clippy::too_many_arguments)]
+async fn insert_plain_table_with_cardinality(
+    txn: &Transaction<'_>,
+    table: &Table,
+    driving_fk: &crate::introspect::ForeignKey,
+    cardinality: &crate::profile::CardinalityProfile,
+    config: &FeintConfig,
+    profile: Option<&crate::profile::ProfileFile>,
+    ref_pool: &mut RefPool,
+    is_referenced: bool,
+) -> Result<u64> {
+    let empty = std::collections::BTreeMap::new();
+    let overrides = config
+        .table_config(&table.id.qualified())
+        .map(|t| &t.columns)
+        .unwrap_or(&empty);
+    let columns = supplied_columns(table);
+    let table_name = table.id.qualified();
+
+    // Snapshot the parent pool up front: `ref_pool` is read-only for the
+    // rest of this function (every FK, including `driving_fk` itself,
+    // still goes through `generate_row`'s normal sampling — its pick for
+    // `driving_fk` just gets overwritten below), so this shared borrow
+    // and the later mutable one for registration don't overlap.
+    let parents: Vec<Vec<PgValue>> = ref_pool
+        .all(&driving_fk.ref_table, &driving_fk.ref_columns)
+        .to_vec();
+
+    let fk_positions: Vec<usize> = driving_fk
+        .columns
+        .iter()
+        .filter_map(|c| columns.iter().position(|col| &col.name == c))
+        .collect();
+
+    let mut rows = Vec::new();
+    let mut row_index: u64 = 0;
+    for (parent_idx, parent_tuple) in parents.iter().enumerate() {
+        let mut count_rng = derive_rng(
+            &config.seed,
+            &SeedKey {
+                table: &table_name,
+                column: &driving_fk.name,
+                row_identity: &parent_idx.to_string(),
+            },
+        );
+        let children = sample_cardinality(&cardinality.histogram, &mut count_rng);
+
+        for _ in 0..children {
+            let row_identity = row_index.to_string();
+            row_index += 1;
+            let mut row = generate_row(
+                table,
+                &columns,
+                &row_identity,
+                &config.seed,
+                overrides,
+                &HashSet::new(),
+                ref_pool,
+                profile,
+            )?;
+            for (&pos, val) in fk_positions.iter().zip(parent_tuple.iter()) {
+                row[pos] = val.clone();
+            }
+            rows.push(row);
+        }
+    }
+
+    if is_referenced {
+        let returning = returning_columns(table);
+        let returned =
+            execute_batched_insert(txn, table, &columns, &rows, &returning, false).await?;
+        register_returned(ref_pool, table, &returning, &returned);
+    } else {
+        crate::copy::copy_rows(txn, table, &columns, &rows).await?;
+    }
+    Ok(rows.len() as u64)
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_backfill_group(
     txn: &Transaction<'_>,
     schema: &Schema,
     tables: &[TableId],
     null_then_backfill: &[FkRef],
     config: &FeintConfig,
+    profile: Option<&crate::profile::ProfileFile>,
     ref_pool: &mut RefPool,
     progress: &mut impl FnMut(ProgressEvent),
 ) -> Result<Vec<(String, u64)>> {
@@ -484,7 +679,7 @@ pub(crate) async fn insert_backfill_group(
 
     for table_id in tables {
         let table = schema.table(table_id).expect("table exists");
-        let planned_rows = rows_for(config, table_id);
+        let planned_rows = rows_for(config, table_id, profile);
         progress(ProgressEvent::TableStarted {
             table: &table_id.qualified(),
             planned_rows,
@@ -508,6 +703,7 @@ pub(crate) async fn insert_backfill_group(
                 overrides,
                 &skip,
                 ref_pool,
+                profile,
             )?);
         }
 
@@ -609,11 +805,13 @@ pub(crate) async fn insert_backfill_group(
     Ok(results)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_deferred_group(
     txn: &Transaction<'_>,
     schema: &Schema,
     tables: &[TableId],
     config: &FeintConfig,
+    profile: Option<&crate::profile::ProfileFile>,
     ref_pool: &mut RefPool,
     progress: &mut impl FnMut(ProgressEvent),
 ) -> Result<Vec<(String, u64)>> {
@@ -669,7 +867,7 @@ pub(crate) async fn insert_deferred_group(
     let mut partial_rows: HashMap<TableId, Vec<Vec<PgValue>>> = HashMap::new();
     for table_id in tables {
         let table = schema.table(table_id).expect("table exists");
-        let planned_rows = rows_for(config, table_id);
+        let planned_rows = rows_for(config, table_id, profile);
         let empty = std::collections::BTreeMap::new();
         let overrides = config
             .table_config(&table_id.qualified())
@@ -688,6 +886,7 @@ pub(crate) async fn insert_deferred_group(
                 overrides,
                 &skip,
                 ref_pool,
+                profile,
             )?);
         }
 
@@ -716,7 +915,7 @@ pub(crate) async fn insert_deferred_group(
     let mut results = Vec::new();
     for table_id in tables {
         let table = schema.table(table_id).expect("table exists");
-        let planned_rows = rows_for(config, table_id);
+        let planned_rows = rows_for(config, table_id, profile);
         progress(ProgressEvent::TableStarted {
             table: &table_id.qualified(),
             planned_rows,

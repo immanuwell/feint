@@ -345,8 +345,9 @@ pub async fn run(
                         insert::insert_plain_table(
                             target_txn,
                             table,
-                            insert::rows_for(config, table_id),
+                            insert::rows_for(config, table_id, None),
                             config,
+                            None,
                             &HashSet::new(),
                             &mut ref_pool,
                             referenced_tables.contains(table_id),
@@ -374,6 +375,7 @@ pub async fn run(
                         schema,
                         tables,
                         config,
+                        None,
                         &mut ref_pool,
                         &mut |_evt| {},
                     )
@@ -422,6 +424,7 @@ pub async fn run(
                         tables,
                         null_then_backfill,
                         config,
+                        None,
                         &mut ref_pool,
                         &mut |_evt| {},
                     )
