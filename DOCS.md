@@ -4,11 +4,13 @@ This is the full reference for seedy. For a quick overview, see [README.md](READ
 
 ## What seedy is
 
-seedy is a command line tool for Postgres. It reads your database schema and generates realistic, valid test data.
+seedy is a command line tool for Postgres. It has two modes.
 
-It has two commands that touch your data: `init` and `up`. A third command, `plan`, only reads your schema. It never writes anything.
+**Generate** reads your database schema and generates realistic, synthetic test data from nothing. Commands: `init`, `plan`, `up`.
 
-Today seedy only generates synthetic data. It does not connect to a production database, copy real rows, or mask real values. That is a planned second mode, not built yet. See [Roadmap](#roadmap).
+**Clone** reads a real source database and writes a copy into a target database, keeping the same primary keys and foreign keys, and masking sensitive columns as it goes. Command: `clone`.
+
+`plan` only reads your schema, it never writes anything. `init`, `up`, and `clone` all touch a database.
 
 ## Install
 
@@ -73,6 +75,88 @@ Generates data and inserts it.
 The whole run happens inside one database transaction. If any row fails to insert, for example a CHECK constraint rejects a generated value, the entire transaction rolls back. Nothing is left half-written.
 
 On success, `up` prints the total row count, the time taken, and confirms that constraints and foreign keys were satisfied.
+
+### seedy clone
+
+```
+seedy clone <SOURCE_URL> <TARGET_URL> [--root "<table> WHERE <condition>"] [--config <PATH>] [--schema <NAME>]...
+```
+
+Reads real rows from `SOURCE_URL` and writes them into `TARGET_URL`, masking sensitive columns as configured (see [Masking](#masking)).
+
+- `<SOURCE_URL>` is only ever read from. seedy opens it as a read only transaction at the database level, not just by convention.
+- `<TARGET_URL>` is written to, inside one transaction. If anything fails, the whole thing rolls back and the target is left exactly as it was.
+- `--root "<table> WHERE <condition>"` clones a subset instead of the whole database. See [Subsetting](#subsetting). Without `--root`, seedy clones every table.
+- `--config <PATH>` reads masking overrides from a `seedy.yaml` file, if one exists. The `rows:` field in that file is ignored by `clone`, it only matters for `up`.
+- `--schema <NAME>` sets which schema to read from source, same as the other commands.
+
+Primary keys and foreign keys are preserved exactly as they are on the source. This means:
+
+- The target tables must already exist with a matching schema before you run `clone`. seedy does not create tables.
+- If you run `clone` twice into the same target without clearing it first, the second run fails on duplicate keys.
+- Sequences and identity columns on the target are advanced past whatever was just inserted, so a normal insert afterward does not collide.
+
+On success, `clone` prints the row count per table and confirms that keys were preserved.
+
+## Masking
+
+By default, `clone` looks at each column's name using the same detection as [Sensitive field detection](#sensitive-field-detection). If a column looks sensitive, it gets replaced with a deterministic fake value. Everything else is copied through unchanged.
+
+"Deterministic" means the same source row always produces the same fake value, every time you run `clone`, as long as the seed stays the same. This is not random noise, it is a stable, repeatable substitute.
+
+You can override the strategy per column in `seedy.yaml`:
+
+```yaml
+version: 1
+seed: default
+tables:
+  public.users:
+    rows: 0
+    columns:
+      email:
+        mask: hash
+      phone:
+        mask: redact
+      internal_notes:
+        mask: none
+```
+
+Strategies:
+
+- `fake`. Deterministic synthetic replacement. This is the default for columns that look sensitive.
+- `hash`. A deterministic one-way hash of the real value. Only works on text-like columns (text, varchar, citext). The result looks like `masked_a1b2c3...` and cannot be reversed back to the original value.
+- `redact`. A fixed placeholder. NULL if the column allows NULL, otherwise a fixed value like `0` or `REDACTED` depending on the column type.
+- `none`. Copies the real value through unchanged. Use this to turn off masking for a column the name-based detection got wrong.
+
+A NULL value always stays NULL, no matter what strategy is set on the column.
+
+Two rules are enforced and cannot be overridden:
+
+- **A primary key column or a foreign key column can never be masked.** Preserving keys unchanged is what makes the whole clone work without rewriting every reference. seedy rejects a config that tries to mask one of these columns before touching either database.
+- **`redact` cannot be used on a column with a unique constraint** (other than the primary key). A fixed placeholder on every row would violate uniqueness. Use `hash` or `fake` there instead, both vary per row.
+
+## Subsetting
+
+`--root "<table> WHERE <condition>"` clones only the rows that belong to a starting condition, instead of the whole database.
+
+Example:
+
+```
+seedy clone $PROD_URL $DEV_URL --root "organizations WHERE id = 42"
+```
+
+This finds organization 42, then works outward in two steps:
+
+1. **Everything that belongs to it.** Any row in another table with a foreign key pointing at an included row gets pulled in too, and this repeats outward. If organization 42 has users, and those users have orders, the users and orders are included.
+2. **Everything it needs to exist.** Once step 1 is done, seedy looks at every included row's own foreign keys and pulls in whatever parent rows are required, so nothing points at a row that isn't there. If an order references a product, that product is pulled in.
+
+Step 2 does not repeat step 1. A product pulled in because one order needs it does not bring along every other order that happens to reference the same product. This is what keeps the subset from growing into the whole database.
+
+A table with no foreign key connection to anything in the subset is left empty on the target. Pure foreign-key-based subsetting cannot discover a table your application only looks up by, say, a hardcoded list, if nothing in the subset actually references it.
+
+There is a safety cap on total row count. If a `--root` condition expands too far (a self-referencing table, like an org chart, is the usual cause), seedy stops and writes nothing to the target, rather than silently copying a partial, broken subset.
+
+The condition after `WHERE` is passed straight through to your source database as SQL. It is not restricted to simple equality, you can write anything Postgres accepts in a WHERE clause.
 
 ## The seedy.yaml file
 
@@ -153,6 +237,8 @@ seedy resolves these in one of three ways, in this order:
 2. **Null then backfill.** If the foreign key column is nullable, seedy inserts the row with that column set to null, then runs an `UPDATE` afterward once every row in the cycle exists.
 3. **Error.** If the foreign key is `NOT NULL` and not `DEFERRABLE`, there is no safe way to insert it. seedy stops and prints an error naming the exact tables and constraints involved, before writing anything. Fix this by making the column nullable or marking the constraint `DEFERRABLE`.
 
+This applies the same way in `clone`. The only difference is which value gets written: `up` writes a freshly generated value, `clone` writes the real (or masked) value it already read from source.
+
 ## Supported Postgres features
 
 | Feature | Support |
@@ -165,7 +251,7 @@ seedy resolves these in one of three ways, in this order:
 | Arrays | Yes, generates a short array of the element type |
 | JSONB and JSON | Yes, generates a small JSON object |
 | UUID primary keys | Yes, generated client side so `--seed` stays reproducible even when the column has a `DEFAULT gen_random_uuid()` |
-| Serial and identity columns | Yes, left for Postgres to assign, then read back |
+| Serial and identity columns | Yes. `up` leaves them for Postgres to assign, then reads the result back. `clone` preserves the source's real value instead, and resyncs the target's sequence afterward so the next unrelated insert does not collide |
 | Partitioned tables | Yes, seedy inserts into the parent table and lets Postgres route rows to partitions |
 | citext, inet, cidr | Yes, but through a generic text value rather than a purpose built generator |
 | CHECK constraints | Detected and shown as a warning and as comments in `seedy.yaml`, but not validated ahead of time. If a generated value fails a check, the whole run rolls back cleanly with an error |
@@ -173,11 +259,11 @@ seedy resolves these in one of three ways, in this order:
 
 ## Sensitive field detection
 
-`seedy init` looks at your column names and flags ones that look like they hold personal data: emails, phone numbers, names, dates of birth, addresses, IP addresses, card numbers, SSNs, and similar identifiers.
+seedy looks at your column names and flags ones that look like they hold personal data: emails, phone numbers, names, dates of birth, addresses, IP addresses, card numbers, SSNs, and similar identifiers.
 
-This is informational only. seedy never touches real data in this mode, everything it generates is synthetic from the start. The point of the banner is to show you, before you generate anything, which columns it noticed and how they will be filled in.
+`seedy init` shows this as a banner, purely informational, since `up` generates everything synthetically anyway. `seedy clone` uses the same detection to decide which columns get masked by default, see [Masking](#masking).
 
-This detection is based on column name patterns only. It does not know what the table is about. A column named `name` on a `users` table and a column named `name` on an `organizations` table are treated the same way right now, which is not always correct. Use an explicit `generator:` override in `seedy.yaml` if a guess is wrong.
+This detection is based on column name patterns only. It does not know what the table is about. A column named `name` on a `users` table and a column named `name` on an `organizations` table are treated the same way right now, which is not always correct. Use an explicit `generator:` (for `up`) or `mask:` (for `clone`) override in `seedy.yaml` if a guess is wrong.
 
 ## Known limitations
 
@@ -185,8 +271,11 @@ This detection is based on column name patterns only. It does not know what the 
 - Composite types (custom `CREATE TYPE ... AS (...)` structs) have no generator yet.
 - citext, inet, and cidr columns use a generic fallback rather than a purpose built generator.
 - The column name heuristic does not know what a table represents, only the column name.
-- The whole run is one transaction. This is correct and safe, but it is not built for generating millions of rows yet.
-- There is no way to avoid duplicate data on a second `up` run against the same tables. Truncate first if you want a clean set.
+- The whole run is one transaction. This is correct and safe, but it is not built for generating or cloning millions of rows yet.
+- There is no way to avoid duplicate data on a second `up` or `clone` run against the same tables. Truncate the target first if you want a clean set.
+- `clone` does not create tables on the target. The target schema must already exist and match the source.
+- `--root` subsetting only follows actual foreign key relationships. A table your application looks up outside of any foreign key is not discovered and stays empty on the target.
+- JSON and JSONB columns are masked or left alone as a whole column. seedy does not look inside a JSON value for PII in a nested field.
 
 ## Development
 
@@ -201,18 +290,18 @@ cargo fmt
 
 The test suite includes:
 
-- Unit tests for the value encoding, the dependency graph, and the generators.
+- Unit tests for the value encoding, the dependency graph, the generators, and the masking transform.
 - Integration tests that create real schemas in a throwaway Postgres container and check the results: composite keys, cycles, enums, arrays, JSONB, citext, partitioned tables, and more.
+- Integration tests with two containers (source and target) for `clone`: key preservation, sequence resync, each masking strategy, the rules that reject unsafe masking configs, and subsetting (a diamond dependency, a self-referencing root, a cap abort).
 - A smoke test that runs the actual compiled binary through `init` and `up`.
 
 ## Roadmap
 
 Not built yet:
 
-- **Clone mode.** Connect to a production database, copy a subset of it (for example, one customer and everything that belongs to them), and mask sensitive columns while copying, instead of generating everything from scratch.
-- **A shared identity layer across modes.** The same source row should map to the same fake identity every time, whether it comes from a fresh `generate` run or a masked `clone` run, so fixtures and snapshots stay consistent with each other.
 - **Migration helpers** for teams moving from Snaplet or Neosync.
 - **Table aware sensitive field detection**, so a `name` column is treated differently on a `users` table versus an `organizations` table.
+- **Snapshot files.** `clone` currently needs a live connection to both the source and target database at once. A `snapshot` / `restore` split, where you extract once to a file and load it later without needing source access again, is not built.
 
 ## License
 

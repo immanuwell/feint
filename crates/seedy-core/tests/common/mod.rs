@@ -257,6 +257,18 @@ impl CloneFixture {
         schema: &Schema,
         config: &SeedyConfig,
     ) -> seedy_core::Result<seedy_core::clone::CloneSummary> {
+        self.clone_subset(schema, config, None).await
+    }
+
+    /// Like [`Self::clone`], but with an optional `--root` spec — computes
+    /// the subset from `source_txn` first (matching the CLI's own
+    /// sequencing) before running the clone with that pre-fetched row set.
+    pub async fn clone_subset(
+        &mut self,
+        schema: &Schema,
+        config: &SeedyConfig,
+        root: Option<&str>,
+    ) -> seedy_core::Result<seedy_core::clone::CloneSummary> {
         let plan = graph::plan_insertion(schema).expect("insertion plan");
         let source_txn = self
             .source_client
@@ -265,14 +277,38 @@ impl CloneFixture {
             .start()
             .await
             .expect("begin source txn");
+
+        let subset = match root {
+            Some(spec) => {
+                let parsed = seedy_core::subset::parse_root(schema, spec)?;
+                let rows = seedy_core::subset::compute_subset(
+                    &source_txn,
+                    schema,
+                    &parsed,
+                    &seedy_core::subset::SubsetOptions::default(),
+                )
+                .await?;
+                Some(rows)
+            }
+            None => None,
+        };
+
         let target_txn = self
             .target_client
             .transaction()
             .await
             .expect("begin target txn");
 
-        let result =
-            seedy_core::clone::run(&source_txn, &target_txn, schema, &plan, config, |_| {}).await;
+        let result = seedy_core::clone::run(
+            &source_txn,
+            &target_txn,
+            schema,
+            &plan,
+            config,
+            subset.as_ref(),
+            |_| {},
+        )
+        .await;
         match &result {
             Ok(_) => {
                 target_txn.commit().await.expect("commit target");

@@ -1,12 +1,12 @@
 # seedy
 
-A single binary that connects to Postgres and generates realistic test data for you.
+A single binary for Postgres test data. Two modes: generate synthetic data from nothing, or clone a real database with sensitive columns masked.
 
 No ORM. No config server. No Docker stack. It reads your schema and writes rows.
 
 seedy understands foreign keys, enums, arrays, JSONB, UUIDs, domains, and cyclic references. It never guesses wrong about your constraints. If a run succeeds, your data is valid.
 
-Every run is deterministic. Same seed, same schema, same output, every time.
+Every run is deterministic. Same seed, same input, same output, every time. A masked column always maps the same source row to the same fake value.
 
 ## Quick demo
 
@@ -50,6 +50,15 @@ Generating...
 All constraints valid
 All foreign keys valid
 0 production values used
+
+$ seedy clone postgres://prod-host/myapp postgres://localhost/myapp_dev --root "organizations WHERE id = 42"
+
+Subset: 219 rows across 6 tables
+
+219 rows cloned in 0.6s
+All constraints valid
+All foreign keys valid
+Primary keys and foreign keys preserved from source
 ```
 
 ## Install
@@ -82,9 +91,11 @@ seedy up postgres://localhost/myapp
 
 ## What it does today
 
-seedy generates synthetic data from your schema. That's it, for now.
+**Generate**: `seedy init` / `plan` / `up`. Builds synthetic data from your schema, nothing real involved.
 
-It does not yet connect to a production database, subset real data, or mask real values. That mode is planned but not built. See `DOCS.md` for the full roadmap.
+**Clone**: `seedy clone`. Copies real rows from a source database to a target database, keeping keys intact and masking sensitive columns. Add `--root` to copy only a subset instead of the whole database.
+
+`clone` needs a live connection to both databases at once. There's no separate "snapshot to a file, restore it later" step yet. See `DOCS.md` for the full roadmap.
 
 ## Full docs
 

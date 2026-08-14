@@ -21,6 +21,7 @@ use crate::graph::{FkRef, InsertGroup, InsertPlan};
 use crate::insert::{execute_batched_insert, sql_cast_type};
 use crate::introspect::{Column, Identity, Schema, Table, TableId};
 use crate::mask::{self, validate_masking_config};
+use crate::subset::SubsetRows;
 use crate::value::PgValue;
 
 pub enum ProgressEvent<'a> {
@@ -53,11 +54,20 @@ pub(crate) fn needs_overriding_system_value(columns: &[&Column]) -> bool {
     columns.iter().any(|c| c.identity == Identity::Always)
 }
 
+/// `subset` is `None` for a full-database clone (read every row) or
+/// `Some` for a `--root`-subsetted clone, in which case the rows for this
+/// table were already selected by `subset::compute_subset` and are used
+/// as-is (a table absent from the map contributes zero rows).
 async fn read_table_rows(
     source_txn: &Transaction<'_>,
     table: &Table,
     columns: &[&Column],
+    subset: Option<&SubsetRows>,
 ) -> Result<Vec<Vec<PgValue>>> {
+    if let Some(subset) = subset {
+        return Ok(subset.get(&table.id).cloned().unwrap_or_default());
+    }
+
     let col_list = columns
         .iter()
         .map(|c| format!("\"{}\"", c.name))
@@ -185,6 +195,7 @@ pub async fn run(
     schema: &Schema,
     plan: &InsertPlan,
     config: &SeedyConfig,
+    subset: Option<&SubsetRows>,
     mut progress: impl FnMut(ProgressEvent),
 ) -> Result<CloneSummary> {
     validate_masking_config(schema, config)?;
@@ -202,7 +213,7 @@ pub async fn run(
                 progress(ProgressEvent::TableStarted {
                     table: &table_id.qualified(),
                 });
-                let n = clone_table_full(source_txn, target_txn, table, config).await?;
+                let n = clone_table_full(source_txn, target_txn, table, config, subset).await?;
                 progress(ProgressEvent::TableFinished {
                     table: &table_id.qualified(),
                     rows: n,
@@ -216,7 +227,7 @@ pub async fn run(
                     progress(ProgressEvent::TableStarted {
                         table: &table_id.qualified(),
                     });
-                    let n = clone_table_full(source_txn, target_txn, table, config).await?;
+                    let n = clone_table_full(source_txn, target_txn, table, config, subset).await?;
                     progress(ProgressEvent::TableFinished {
                         table: &table_id.qualified(),
                         rows: n,
@@ -236,6 +247,7 @@ pub async fn run(
                     tables,
                     null_then_backfill,
                     config,
+                    subset,
                     &mut progress,
                 )
                 .await?;
@@ -258,9 +270,10 @@ async fn clone_table_full(
     target_txn: &Transaction<'_>,
     table: &Table,
     config: &SeedyConfig,
+    subset: Option<&SubsetRows>,
 ) -> Result<u64> {
     let columns = clone_supplied_columns(table);
-    let rows = read_table_rows(source_txn, table, &columns).await?;
+    let rows = read_table_rows(source_txn, table, &columns, subset).await?;
     let rows = mask_rows(table, &columns, rows, config)?;
     let overriding = needs_overriding_system_value(&columns);
     execute_batched_insert(target_txn, table, &columns, &rows, &[], overriding).await?;
@@ -268,6 +281,7 @@ async fn clone_table_full(
     Ok(rows.len() as u64)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn clone_backfill_group(
     source_txn: &Transaction<'_>,
     target_txn: &Transaction<'_>,
@@ -275,6 +289,7 @@ async fn clone_backfill_group(
     tables: &[TableId],
     null_then_backfill: &[FkRef],
     config: &SeedyConfig,
+    subset: Option<&SubsetRows>,
     progress: &mut impl FnMut(ProgressEvent),
 ) -> Result<Vec<(String, u64)>> {
     let mut skip_by_table: HashMap<TableId, HashSet<String>> = HashMap::new();
@@ -295,7 +310,7 @@ async fn clone_backfill_group(
         });
 
         let columns = clone_supplied_columns(table);
-        let full_rows = read_table_rows(source_txn, table, &columns).await?;
+        let full_rows = read_table_rows(source_txn, table, &columns, subset).await?;
         let full_rows = mask_rows(table, &columns, full_rows, config)?;
 
         let skip = skip_by_table.get(table_id).cloned().unwrap_or_default();

@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use seedy_core::config::SeedyConfig;
+use seedy_core::subset::{compute_subset, parse_root, SubsetOptions};
 use seedy_core::{clone, graph, introspect};
 
 use crate::ui;
@@ -12,12 +13,6 @@ pub async fn run(
     config_path: &Path,
     schemas: &[String],
 ) -> anyhow::Result<()> {
-    if root.is_some() {
-        anyhow::bail!(
-            "--root subsetting isn't implemented yet — omit it to clone the whole database"
-        );
-    }
-
     let config = if config_path.exists() {
         SeedyConfig::load(config_path)?
     } else {
@@ -58,6 +53,44 @@ pub async fn run(
         .read_only(true)
         .start()
         .await?;
+
+    // Subsetting only ever reads from `source_txn` — nothing is written
+    // to target until this resolves, so a cap-abort or a bad --root
+    // leaves the target database untouched.
+    let subset = match &root {
+        Some(root_spec) => {
+            let parsed = match parse_root(&schema, root_spec) {
+                Ok(r) => r,
+                Err(e) => {
+                    source_txn.rollback().await.ok();
+                    ui::error(format!("{e}"));
+                    return Err(e.into());
+                }
+            };
+            let spinner = ui::spinner(format!("Subsetting from {root_spec}..."));
+            let result =
+                compute_subset(&source_txn, &schema, &parsed, &SubsetOptions::default()).await;
+            spinner.finish_and_clear();
+            match result {
+                Ok(rows) => {
+                    let table_count = rows.values().filter(|r| !r.is_empty()).count();
+                    let row_count: usize = rows.values().map(|r| r.len()).sum();
+                    ui::check(format!(
+                        "Subset: {} rows across {table_count} tables",
+                        ui::format_count(row_count as u64)
+                    ));
+                    Some(rows)
+                }
+                Err(e) => {
+                    source_txn.rollback().await.ok();
+                    ui::error(format!("{e}"));
+                    return Err(e.into());
+                }
+            }
+        }
+        None => None,
+    };
+
     let target_txn = target_client.transaction().await?;
 
     let spinner = ui::spinner("Cloning...");
@@ -67,6 +100,7 @@ pub async fn run(
         &schema,
         &plan,
         &config,
+        subset.as_ref(),
         |_event| {},
     )
     .await;
