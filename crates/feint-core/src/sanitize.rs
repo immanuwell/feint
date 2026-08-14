@@ -22,11 +22,10 @@ use tokio_postgres::{Client, Transaction};
 use crate::config::FeintConfig;
 use crate::error::{FeintError, Result};
 use crate::insert::sql_cast_type;
-use crate::introspect::{Schema, Table, TableId};
+use crate::introspect::{Schema, Table, TableId, MASK_CHECKPOINT_TABLE as CHECKPOINT_TABLE};
 use crate::mask::{self, validate_masking_config, MaskStrategy};
 use crate::value::PgValue;
 
-const CHECKPOINT_TABLE: &str = "_feint_mask_checkpoint";
 const MAX_BIND_PARAMS: usize = 60_000;
 
 #[derive(Debug, Clone)]

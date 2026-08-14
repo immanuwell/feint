@@ -101,6 +101,68 @@ async fn masks_across_many_batches_and_preserves_row_count() {
     );
 }
 
+/// A completed mask run leaves its `_feint_mask_checkpoint` bookkeeping
+/// table behind in the schema. Every other command re-introspects that
+/// same schema afterward, so the checkpoint table must never show up as
+/// user schema — `up` would otherwise generate garbage synthetic rows into
+/// it, corrupting the checkpoint state undetected.
+#[tokio::test]
+async fn checkpoint_table_is_excluded_from_schema_introspection() {
+    let mut db = TestDb::setup(
+        "sanitize_checkpoint_hidden",
+        "CREATE TABLE users (id serial PRIMARY KEY, email text NOT NULL);",
+    )
+    .await;
+    db.client
+        .batch_execute("INSERT INTO users (email) VALUES ('a@corp.com'), ('b@corp.com')")
+        .await
+        .unwrap();
+
+    let schema = db.introspect().await;
+    let config = FeintConfig {
+        version: 1,
+        seed: "default".to_string(),
+        tables: BTreeMap::new(),
+    };
+    let plan = sanitize::plan_sanitization(&schema, &config).unwrap();
+    sanitize::run_sanitization(
+        &mut db.client,
+        &schema,
+        &plan,
+        &config,
+        10,
+        false,
+        None,
+        no_progress,
+    )
+    .await
+    .unwrap();
+
+    let checkpoint_exists: i64 = db
+        .client
+        .query_one(
+            "SELECT count(*) FROM information_schema.tables \
+             WHERE table_name = '_feint_mask_checkpoint' AND table_schema = $1",
+            &[&db.schema_name],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        checkpoint_exists, 1,
+        "sanity check: the checkpoint table must actually exist after a mask run"
+    );
+
+    let schema_after = db.introspect().await;
+    assert!(
+        schema_after
+            .tables
+            .iter()
+            .all(|t| t.id.name != "_feint_mask_checkpoint"),
+        "introspection must never surface feint's own checkpoint table as user schema"
+    );
+}
+
 /// The core correctness property: after a genuinely partial run (stopped
 /// honestly mid-way via `max_batches`, not simulated) followed by
 /// `--resume`, every row — both the ones masked in the first session and

@@ -9,6 +9,13 @@ use tokio_postgres::Client;
 
 use crate::error::Result;
 
+/// Name of the bookkeeping table `mask`'s checkpoint mechanism creates
+/// (see `sanitize.rs`). Reserved and excluded from every introspected
+/// [`Schema`] — it is feint's own internal state, never user schema, and
+/// must never be treated as a table to generate into, clone, mask, or
+/// track a classification lockfile entry for.
+pub(crate) const MASK_CHECKPOINT_TABLE: &str = "_feint_mask_checkpoint";
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TableId {
     pub schema: String,
@@ -168,7 +175,10 @@ pub async fn introspect(client: &Client, schemas: &[String]) -> Result<Schema> {
 /// (`relispartition`) so a partitioned table is represented exactly once by
 /// its top-level parent — inserting into a child directly would bypass
 /// Postgres's partition routing, and counting children as separate tables
-/// would double up FK relationships.
+/// would double up FK relationships. Also excludes [`MASK_CHECKPOINT_TABLE`]
+/// regardless of which schema it landed in — `ensure_checkpoint_table`
+/// creates it unqualified, so it can end up anywhere on the connection's
+/// `search_path`, not necessarily whichever schema `--schema` named.
 async fn list_tables(client: &Client, schemas: &[String]) -> Result<Vec<RawTable>> {
     let rows = client
         .query(
@@ -178,8 +188,9 @@ async fn list_tables(client: &Client, schemas: &[String]) -> Result<Vec<RawTable
              WHERE c.relkind IN ('r', 'p') \
                AND NOT c.relispartition \
                AND n.nspname = ANY($1) \
+               AND c.relname <> $2 \
              ORDER BY n.nspname, c.relname",
-            &[&schemas],
+            &[&schemas, &MASK_CHECKPOINT_TABLE],
         )
         .await?;
 
