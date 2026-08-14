@@ -18,13 +18,7 @@ pub async fn run(
         config.seed = seed;
     }
 
-    let (mut client, connection) =
-        tokio_postgres::connect(database_url, tokio_postgres::NoTls).await?;
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("connection error: {e}");
-        }
-    });
+    let mut client = seedy_core::connect::connect(database_url).await?;
 
     let spinner = ui::spinner("Inspecting schema...");
     let schema = introspect::introspect(&client, schemas).await?;

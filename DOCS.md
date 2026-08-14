@@ -4,13 +4,15 @@ This is the full reference for seedy. For a quick overview, see [README.md](READ
 
 ## What seedy is
 
-seedy is a command line tool for Postgres. It has two modes.
+seedy is a command line tool for Postgres. It has three modes.
 
 **Generate** reads your database schema and generates realistic, synthetic test data from nothing. Commands: `init`, `plan`, `up`.
 
 **Clone** reads a real source database and writes a copy into a target database, keeping the same primary keys and foreign keys, and masking sensitive columns as it goes. Command: `clone`.
 
-`plan` only reads your schema, it never writes anything. `init`, `up`, and `clone` all touch a database.
+**Mask** rewrites a database's own sensitive columns in place, on that same database, no second database involved. Command: `mask`. This is for a workflow clone can't cover: a database that already got a full physical copy from somewhere else (a cloud snapshot restore is the common case), and now needs its own PII scrubbed before anyone treats it as safe to use.
+
+`plan` only reads your schema, it never writes anything. `init`, `up`, `clone`, and `mask` all touch a database.
 
 ## Install
 
@@ -98,11 +100,37 @@ Primary keys and foreign keys are preserved exactly as they are on the source. T
 
 On success, `clone` prints the row count per table and confirms that keys were preserved.
 
+### seedy mask
+
+```
+seedy mask <DATABASE_URL> [--config <PATH>] [--schema <NAME>]... [--batch-size N] [--dry-run] [--yes] [--resume] [--max-batches N]
+```
+
+Rewrites a single database's own sensitive columns in place. One connection, read and write. No second database, no key remapping, no row inserted or deleted, ever, only `UPDATE` on existing columns.
+
+This is for a case `clone` does not cover: a database that already has a full, real copy of your data through some other means, most commonly a cloud provider's own snapshot-and-restore mechanism (see [Mask-in-place and a snapshot-restore workflow](#mask-in-place-and-a-snapshot-restore-workflow) below). By the time seedy could get involved, the data already exists, unmasked, on one database. `clone` streams and masks between two databases; `mask` scrubs one database that already has everything.
+
+- `<DATABASE_URL>` is both read from and written to.
+- `--config <PATH>` reads masking overrides from `seedy.yaml`, same format and same strategies as `clone` (see [Masking](#masking)). The default is the same too: a column that looks sensitive gets `fake`, everything else passes through.
+- `--batch-size N` sets rows per `UPDATE` batch. Default 5000. Rows are processed in primary-key order, in batches, each batch its own transaction, not the whole table in one transaction.
+- `--dry-run` reports which tables and columns would be touched, and how many rows, without writing anything. This is the recommended first step, always, before a real run.
+- `--yes` skips the interactive confirmation prompt. Without it, `mask` prints the exact target and table/column list and asks you to type "yes" before writing anything. Needed for scripted or CI use.
+- `--resume` continues a previous run that stopped partway through (crashed, was killed, or hit `--max-batches`), picking up exactly where it left off. Without `--resume`, a run refuses to start at all if it finds unfinished progress from an earlier attempt. You have to choose to continue it, seedy will not guess.
+- `--max-batches N` stops the whole run after N batches, leaving a valid, resumable checkpoint. Useful for pacing a very large run across more than one invocation. Unlimited if omitted.
+
+`mask` tracks its own progress in a small table it creates on the target, `_seedy_mask_checkpoint`, one row per table it has touched. This is what makes `--resume` safe: each batch's `UPDATE` and its checkpoint update commit together, in the same transaction, so a row is read and masked exactly once, ever, no matter how many times a run gets interrupted and resumed. This matters specifically for the `hash` strategy, which is keyed off a column's real value. Re-masking an already-masked row would hash the masked output instead of the original, which is exactly what the checkpoint is there to prevent.
+
+Before and after masking each table, `mask` checks the row count is unchanged. `mask` only ever runs `UPDATE`. A row-count mismatch is a hard error, not a warning, since it would mean something else wrote to the table while masking was running.
+
+On success, `mask` prints the row count masked per table and confirms row counts and keys were untouched.
+
 ## Masking
 
-By default, `clone` looks at each column's name using the same detection as [Sensitive field detection](#sensitive-field-detection). If a column looks sensitive, it gets replaced with a deterministic fake value. Everything else is copied through unchanged.
+`clone` and `mask` share the same masking logic and the same `seedy.yaml` format.
 
-"Deterministic" means the same source row always produces the same fake value, every time you run `clone`, as long as the seed stays the same. This is not random noise, it is a stable, repeatable substitute.
+By default, both look at each column's name using the same detection as [Sensitive field detection](#sensitive-field-detection). If a column looks sensitive, it gets replaced with a deterministic fake value. Everything else is copied or left through unchanged.
+
+"Deterministic" means the same source row always produces the same fake value, every time you run `clone` or `mask`, as long as the seed stays the same. This is not random noise, it is a stable, repeatable substitute.
 
 You can override the strategy per column in `seedy.yaml`:
 
@@ -132,8 +160,10 @@ A NULL value always stays NULL, no matter what strategy is set on the column.
 
 Two rules are enforced and cannot be overridden:
 
-- **A primary key column or a foreign key column can never be masked.** Preserving keys unchanged is what makes the whole clone work without rewriting every reference. seedy rejects a config that tries to mask one of these columns before touching either database.
+- **A primary key column or a foreign key column can never be masked.** For `clone`, this is what lets keys carry over unchanged without rewriting every reference. For `mask`, it's even more important: there is no separate untouched copy to fall back to if a key gets corrupted in place. seedy rejects a config that tries to mask one of these columns before touching any database.
 - **`redact` cannot be used on a column with a unique constraint** (other than the primary key). A fixed placeholder on every row would violate uniqueness. Use `hash` or `fake` there instead, both vary per row.
+
+`mask` has one further requirement `clone` does not: a table with a column to mask must have a primary key. Masking needs a stable, ordered key to batch and checkpoint against. A table with a sensitive-looking column and no primary key is rejected with a clear error rather than skipped silently. Set `mask: none` on that column explicitly if you want to leave it alone.
 
 ## Subsetting
 
@@ -157,6 +187,30 @@ A table with no foreign key connection to anything in the subset is left empty o
 There is a safety cap on total row count. If a `--root` condition expands too far (a self-referencing table, like an org chart, is the usual cause), seedy stops and writes nothing to the target, rather than silently copying a partial, broken subset.
 
 The condition after `WHERE` is passed straight through to your source database as SQL. It is not restricted to simple equality, you can write anything Postgres accepts in a WHERE clause.
+
+## Mask-in-place and a snapshot-restore workflow
+
+A common way teams refresh a lower environment (staging, a scratch database, a local copy) from production is entirely outside seedy: a cloud provider's own snapshot-and-restore mechanism copies the whole database at the storage level, into a new, temporarily-named instance, and only afterward is that instance renamed or repointed to take over the "staging" identifier. This is often preferred over a logical dump/restore because it barely touches the live source, doesn't depend on network throughput between the two environments, and sidesteps client/server version mismatches.
+
+That workflow has no masking step by default. It's a block-level copy, so whatever the source has, the restored instance has too, in full, unmasked, the moment the restore finishes.
+
+`seedy mask` is meant to be one new step inserted into that existing workflow, in one specific place: **after the restore finishes and is verified, but before the restored instance takes over the environment's real identifier or receives any live traffic.**
+
+```
+1. Snapshot the source.
+2. Restore the snapshot into a new, temporarily-named instance.
+3. Verify the restore (size, schema, freshness).
+3.5  <-- seedy mask runs here, against the temporary instance's own connection string
+4. Cut the new instance over to the environment's real identifier / DNS name.
+5. (whatever else the workflow already does: credential reset, state reconciliation, traffic verification)
+```
+
+The ordering is the point. If masking happened after step 4 instead, the identifier that the rest of your system treats as "safe to use" would hold real, unmasked data for however long the masking run takes. Even if nobody happens to query it in that window, it's still sitting there. Masking before the cutover means the identifier the environment actually points at never, at any point, holds unmasked data.
+
+Two things worth knowing before wiring this in:
+
+- **`seedy mask` only ever needs one connection string.** It has no awareness of snapshots, cloud APIs, or which instance is "temporary" versus "real". From its side, this is just "mask this one Postgres database." Getting the right connection string to it, and only the right one, is entirely the operator's (or the surrounding script's) responsibility. Treat the target as if it might be a mistake waiting to happen: `--dry-run` first, review what it says it will touch, then a real run.
+- **Check your database's TLS requirements before the first attempt.** Some managed Postgres services require an encrypted connection even when you're already tunneling through SSH, since the requirement is enforced by Postgres itself, not by the transport underneath. Pass `sslmode=require` in the connection string if a plain connection is refused with something like "no pg_hba.conf entry ... no encryption."
 
 ## The seedy.yaml file
 
@@ -276,6 +330,8 @@ This detection is based on column name patterns only. It does not know what the 
 - `clone` does not create tables on the target. The target schema must already exist and match the source.
 - `--root` subsetting only follows actual foreign key relationships. A table your application looks up outside of any foreign key is not discovered and stays empty on the target.
 - JSON and JSONB columns are masked or left alone as a whole column. seedy does not look inside a JSON value for PII in a nested field.
+- `mask` requires a primary key on any table it needs to touch (see [Masking](#masking)).
+- TLS support covers `sslmode=require`/`prefer` (encrypted, certificate not verified) and `disable` (plain). `verify-ca`/`verify-full` (full certificate chain and hostname verification) are not implemented yet and are rejected with a clear error rather than silently downgraded.
 
 ## Development
 
@@ -293,6 +349,7 @@ The test suite includes:
 - Unit tests for the value encoding, the dependency graph, the generators, and the masking transform.
 - Integration tests that create real schemas in a throwaway Postgres container and check the results: composite keys, cycles, enums, arrays, JSONB, citext, partitioned tables, and more.
 - Integration tests with two containers (source and target) for `clone`: key preservation, sequence resync, each masking strategy, the rules that reject unsafe masking configs, and subsetting (a diamond dependency, a self-referencing root, a cap abort).
+- Integration tests for `mask`: batching across many rows, a genuinely interrupted-and-resumed run verified against independently-computed expected output (not just spot-checked), the same unsafe-config rejections as `clone`, and the row-count invariant.
 - A smoke test that runs the actual compiled binary through `init` and `up`.
 
 ## Roadmap
@@ -302,6 +359,8 @@ Not built yet:
 - **Migration helpers** for teams moving from Snaplet or Neosync.
 - **Table aware sensitive field detection**, so a `name` column is treated differently on a `users` table versus an `organizations` table.
 - **Snapshot files.** `clone` currently needs a live connection to both the source and target database at once. A `snapshot` / `restore` split, where you extract once to a file and load it later without needing source access again, is not built.
+- **Full TLS certificate verification** (`verify-ca`/`verify-full`), for setups that need it rather than just an encrypted connection.
+- **Post-mask verification pass.** A second, independent check after `mask` completes, re-running the sensitive-field detection against the masked values to confirm they no longer look like real data, as defense in depth on top of the masking itself.
 
 ## License
 

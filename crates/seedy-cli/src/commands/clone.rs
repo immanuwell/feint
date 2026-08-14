@@ -23,20 +23,8 @@ pub async fn run(
         }
     };
 
-    let (mut source_client, source_conn) =
-        tokio_postgres::connect(source_url, tokio_postgres::NoTls).await?;
-    tokio::spawn(async move {
-        if let Err(e) = source_conn.await {
-            eprintln!("source connection error: {e}");
-        }
-    });
-    let (mut target_client, target_conn) =
-        tokio_postgres::connect(target_url, tokio_postgres::NoTls).await?;
-    tokio::spawn(async move {
-        if let Err(e) = target_conn.await {
-            eprintln!("target connection error: {e}");
-        }
-    });
+    let mut source_client = seedy_core::connect::connect(source_url).await?;
+    let mut target_client = seedy_core::connect::connect(target_url).await?;
 
     let spinner = ui::spinner("Inspecting source schema...");
     let schema = introspect::introspect(&source_client, schemas).await?;

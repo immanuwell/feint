@@ -33,6 +33,8 @@ chrono = { version = "0.4", features = ["serde"] }
 rust_decimal = { version = "1", features = ["db-tokio-postgres"] }
 thiserror = "1"
 anyhow = "1"
+native-tls = "0.2"
+postgres-native-tls = "0.5"
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["postgres"] }
 rstest = "0.23"

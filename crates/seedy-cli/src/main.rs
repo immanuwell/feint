@@ -58,7 +58,7 @@ enum Command {
         source_url: String,
         /// Postgres connection URL to write into.
         target_url: String,
-        /// Subset root, e.g. "public.organizations WHERE id = 42". Not implemented yet.
+        /// Subset root, e.g. "public.organizations WHERE id = 42". Omit to clone the whole database.
         #[arg(long)]
         root: Option<String>,
         /// Config file with masking overrides, if present.
@@ -67,6 +67,33 @@ enum Command {
         /// Schema(s) to introspect. Repeat to include more than one.
         #[arg(long = "schema", default_value = "public")]
         schemas: Vec<String>,
+    },
+    /// Mask sensitive columns of a database in place. Row values only — no schema change, no row insert/delete.
+    Mask {
+        /// Postgres connection URL to mask in place.
+        database_url: String,
+        /// Config file with masking overrides, if present.
+        #[arg(long, default_value = "seedy.yaml")]
+        config: std::path::PathBuf,
+        /// Schema(s) to introspect. Repeat to include more than one.
+        #[arg(long = "schema", default_value = "public")]
+        schemas: Vec<String>,
+        /// Rows per UPDATE batch.
+        #[arg(long, default_value_t = 5000)]
+        batch_size: usize,
+        /// Report what would be masked and how many rows, without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+        /// Continue a previous interrupted run from its checkpoint.
+        #[arg(long)]
+        resume: bool,
+        /// Stop after this many batches (across all tables), leaving a valid checkpoint to
+        /// --resume from later. Useful for pacing a very large run. Unlimited if omitted.
+        #[arg(long)]
+        max_batches: Option<usize>,
     },
 }
 
@@ -97,5 +124,27 @@ async fn main() -> anyhow::Result<()> {
             config,
             schemas,
         } => commands::clone::run(&source_url, &target_url, root, &config, &schemas).await,
+        Command::Mask {
+            database_url,
+            config,
+            schemas,
+            batch_size,
+            dry_run,
+            yes,
+            resume,
+            max_batches,
+        } => {
+            commands::mask::run(
+                &database_url,
+                &config,
+                &schemas,
+                batch_size,
+                dry_run,
+                yes,
+                resume,
+                max_batches,
+            )
+            .await
+        }
     }
 }

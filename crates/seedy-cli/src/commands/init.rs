@@ -8,12 +8,7 @@ use crate::ui;
 
 pub async fn run(database_url: &str, config_path: &Path, schemas: &[String]) -> anyhow::Result<()> {
     let spinner = ui::spinner("Analyzing database...");
-    let (client, connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls).await?;
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("connection error: {e}");
-        }
-    });
+    let client = seedy_core::connect::connect(database_url).await?;
 
     let schema = introspect::introspect(&client, schemas).await?;
     spinner.finish_and_clear();

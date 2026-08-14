@@ -1,6 +1,6 @@
 # seedy
 
-A single binary for Postgres test data. Two modes: generate synthetic data from nothing, or clone a real database with sensitive columns masked.
+A single binary for Postgres test data. Generate synthetic data from nothing, clone a real database with sensitive columns masked, or mask a database's own sensitive columns in place.
 
 No ORM. No config server. No Docker stack. It reads your schema and writes rows.
 
@@ -59,6 +59,17 @@ Subset: 219 rows across 6 tables
 All constraints valid
 All foreign keys valid
 Primary keys and foreign keys preserved from source
+
+$ seedy mask postgres://localhost/myapp_stage --yes
+
+Tables and columns to mask:
+  public.users: email (fake), phone (fake), ssn (fake)
+
+Masking...
+
+234 rows masked
+Row counts unchanged on every table
+Primary keys and foreign keys untouched
 ```
 
 ## Install
@@ -94,6 +105,8 @@ seedy up postgres://localhost/myapp
 **Generate**: `seedy init` / `plan` / `up`. Builds synthetic data from your schema, nothing real involved.
 
 **Clone**: `seedy clone`. Copies real rows from a source database to a target database, keeping keys intact and masking sensitive columns. Add `--root` to copy only a subset instead of the whole database.
+
+**Mask**: `seedy mask`. Rewrites a single database's own sensitive columns in place. No second database. This is the right tool when a database already got a full copy from somewhere else (a cloud snapshot restore, most commonly) and now needs its own PII scrubbed. Batched, resumable if interrupted, with a dry run and a confirmation step before it writes anything.
 
 `clone` needs a live connection to both databases at once. There's no separate "snapshot to a file, restore it later" step yet. See `DOCS.md` for the full roadmap.
 

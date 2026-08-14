@@ -95,8 +95,8 @@ pub fn validate_masking_config(schema: &Schema, config: &SeedyConfig) -> Result<
             if is_key_column(table, col_name) {
                 return Err(SeedyError::Config(format!(
                     "`{}`.`{col_name}` cannot be masked: it is part of a primary key or foreign \
-                     key, and masking it would break referential integrity on the target clone. \
-                     Remove the `mask:` override, or set it to `none`.",
+                     key, and masking it would break referential integrity. Remove the `mask:` \
+                     override, or set it to `none`.",
                     table.id.qualified()
                 )));
             }
@@ -136,7 +136,7 @@ fn is_hashable_type(column: &Column) -> bool {
 /// Apply masking to one column's real value from one source row.
 /// `row_identity` should come from [`row_identity_key`] so `fake` masking
 /// produces the same output for the same source row across repeated
-/// `seedy clone` runs.
+/// `seedy clone`/`seedy mask` runs.
 pub fn mask_value(
     strategy: MaskStrategy,
     column: &Column,
