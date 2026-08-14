@@ -1,17 +1,17 @@
-# seedy
+# feint
 
 A single binary for Postgres test data. Generate synthetic data from nothing, clone a real database with sensitive columns masked, mask a database's own sensitive columns in place, or migrate a config from another tool.
 
 No ORM. No config server. No Docker stack. It reads your schema and writes rows.
 
-seedy understands foreign keys, enums, arrays, JSONB, UUIDs, domains, and cyclic references. It never guesses wrong about your constraints. If a run succeeds, your data is valid.
+feint understands foreign keys, enums, arrays, JSONB, UUIDs, domains, and cyclic references. It never guesses wrong about your constraints. If a run succeeds, your data is valid.
 
 Every run is deterministic. Same seed, same input, same output, every time. A masked column always maps the same source row to the same fake value.
 
 ## Quick demo
 
 ```
-$ seedy init postgres://localhost/myapp
+$ feint init postgres://localhost/myapp
 
 6 tables
 5 foreign keys
@@ -23,9 +23,9 @@ Sensitive fields detected:
   users.phone          phone
   payments.card_last4  potential_identifier
 
-Generated seedy.yaml
+Generated feint.yaml
 
-$ seedy plan postgres://localhost/myapp
+$ feint plan postgres://localhost/myapp
 
 users
 ├── memberships
@@ -42,7 +42,7 @@ Insertion order:
 
 Estimated 500 rows total
 
-$ seedy up postgres://localhost/myapp
+$ feint up postgres://localhost/myapp
 
 Generating...
 
@@ -51,7 +51,7 @@ All constraints valid
 All foreign keys valid
 0 production values used
 
-$ seedy clone postgres://prod-host/myapp postgres://localhost/myapp_dev --root "organizations WHERE id = 42"
+$ feint clone postgres://prod-host/myapp postgres://localhost/myapp_dev --root "organizations WHERE id = 42"
 
 Subset: 219 rows across 6 tables
 
@@ -60,7 +60,7 @@ All constraints valid
 All foreign keys valid
 Primary keys and foreign keys preserved from source
 
-$ seedy mask postgres://localhost/myapp_stage --yes
+$ feint mask postgres://localhost/myapp_stage --yes
 
 Tables and columns to mask:
   public.users: email (fake), phone (fake), ssn (fake)
@@ -79,22 +79,22 @@ You need Rust and Cargo. Get them from [rustup.rs](https://rustup.rs) if you don
 Build from source:
 
 ```
-git clone <this-repo>
-cd seedy
+git clone https://github.com/immanuwell/feint.git
+cd feint
 cargo build --release
 ```
 
-The binary is at `target/release/seedy`. Put it on your `PATH`, or run it directly.
+The binary is at `target/release/feint`. Put it on your `PATH`, or run it directly.
 
 ## Quick start
 
 ```
-seedy init postgres://localhost/myapp
-seedy plan postgres://localhost/myapp
-seedy up postgres://localhost/myapp
+feint init postgres://localhost/myapp
+feint plan postgres://localhost/myapp
+feint up postgres://localhost/myapp
 ```
 
-`init` reads your schema and writes a `seedy.yaml` config.
+`init` reads your schema and writes a `feint.yaml` config.
 
 `plan` shows what will happen: the table dependency order and how many rows each table gets. It never touches the database.
 
@@ -102,19 +102,19 @@ seedy up postgres://localhost/myapp
 
 ## What it does today
 
-**Generate**: `seedy init` / `plan` / `up`. Builds synthetic data from your schema, nothing real involved.
+**Generate**: `feint init` / `plan` / `up`. Builds synthetic data from your schema, nothing real involved.
 
-**Clone**: `seedy clone`. Copies real rows from a source database to a target database, keeping keys intact and masking sensitive columns. Add `--root` to copy only a subset instead of the whole database.
+**Clone**: `feint clone`. Copies real rows from a source database to a target database, keeping keys intact and masking sensitive columns. Add `--root` to copy only a subset instead of the whole database.
 
-**Mask**: `seedy mask`. Rewrites a single database's own sensitive columns in place. No second database. This is the right tool when a database already got a full copy from somewhere else (a cloud snapshot restore, most commonly) and now needs its own PII scrubbed. Batched, resumable if interrupted, with a dry run and a confirmation step before it writes anything.
+**Mask**: `feint mask`. Rewrites a single database's own sensitive columns in place. No second database. This is the right tool when a database already got a full copy from somewhere else (a cloud snapshot restore, most commonly) and now needs its own PII scrubbed. Batched, resumable if interrupted, with a dry run and a confirmation step before it writes anything.
 
-**Migrate**: `seedy migrate snaplet` / `seedy migrate neosync`. Converts a Snaplet Seed or Neosync config into a starting `seedy.yaml`. Best effort, prints what converted and what needs a manual look.
+**Migrate**: `feint migrate snaplet` / `feint migrate neosync`. Converts a Snaplet Seed or Neosync config into a starting `feint.yaml`. Best effort, prints what converted and what needs a manual look.
 
 `clone` needs a live connection to both databases at once. There's no separate "snapshot to a file, restore it later" step yet. See `DOCS.md` for the full roadmap.
 
 ## Full docs
 
-See [DOCS.md](DOCS.md) for the complete command reference, the `seedy.yaml` format, supported Postgres features, and known limitations.
+See [DOCS.md](DOCS.md) for the complete command reference, the `feint.yaml` format, supported Postgres features, and known limitations.
 
 ## License
 
