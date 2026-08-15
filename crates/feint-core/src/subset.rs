@@ -402,6 +402,7 @@ mod tests {
                 position: 1,
                 type_name: "int4".to_string(),
                 type_kind: TypeKind::Scalar,
+                max_length: None,
                 nullable: false,
                 identity: Identity::None,
                 is_stored_generated: false,

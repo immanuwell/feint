@@ -396,6 +396,103 @@ fn generate_row(
         .collect())
 }
 
+/// How many times a single row is regenerated before giving up on avoiding
+/// a collision with one of the table's own UNIQUE constraints — well above
+/// what any real FK-pool-exhaustion case should need, but finite so a
+/// genuinely-too-small parent pool fails with a clear error instead of
+/// looping forever.
+const MAX_UNIQUE_RETRY_ATTEMPTS: u32 = 50;
+
+/// Index sets (into `columns`) for each of `table`'s UNIQUE constraints —
+/// including the primary key — skipping any constraint whose columns
+/// aren't all in `columns` (e.g. a server-assigned PK, which Postgres's own
+/// sequence already keeps unique without feint's help).
+fn unique_key_index_sets(table: &Table, columns: &[&Column]) -> Vec<Vec<usize>> {
+    table
+        .unique_constraints
+        .iter()
+        .filter_map(|uc| {
+            uc.columns
+                .iter()
+                .map(|c| columns.iter().position(|col| &col.name == c))
+                .collect::<Option<Vec<usize>>>()
+        })
+        .collect()
+}
+
+/// Generate one row, retrying with a different derived seed if it collides
+/// with an already-generated row of the same batch on any of `table`'s
+/// UNIQUE constraints. Plain per-row-independent `RefPool` sampling has no
+/// way to know about sibling rows in the same batch, so a composite or
+/// single-column UNIQUE foreign key — Miniflux's `integrations.user_id` (a
+/// 1:1 PK-as-FK), Listmonk's `roles` table's `UNIQUE (parent_id, list_id)`
+/// — can otherwise collide at random and crash the whole batch on a
+/// duplicate-key error. NULLs are never considered a collision, matching
+/// Postgres's own default (non-`NULLS NOT DISTINCT`) unique semantics.
+#[allow(clippy::too_many_arguments)]
+fn generate_unique_row(
+    table: &Table,
+    columns: &[&Column],
+    row_index: u64,
+    global_seed: &str,
+    overrides: &std::collections::BTreeMap<String, crate::config::ColumnConfig>,
+    skip_fk_columns: &HashSet<String>,
+    ref_pool: &RefPool,
+    profile: Option<&crate::profile::ProfileFile>,
+    key_sets: &[Vec<usize>],
+    seen: &mut [Vec<Vec<PgValue>>],
+) -> Result<Vec<PgValue>> {
+    for attempt in 0..=MAX_UNIQUE_RETRY_ATTEMPTS {
+        let row_identity = if attempt == 0 {
+            row_index.to_string()
+        } else {
+            format!("{row_index}#retry{attempt}")
+        };
+        let row = generate_row(
+            table,
+            columns,
+            &row_identity,
+            global_seed,
+            overrides,
+            skip_fk_columns,
+            ref_pool,
+            profile,
+        )?;
+
+        let tuples: Vec<Option<Vec<PgValue>>> = key_sets
+            .iter()
+            .map(|key| {
+                let tuple: Vec<PgValue> = key.iter().map(|&i| row[i].clone()).collect();
+                if tuple.iter().any(PgValue::is_null) {
+                    None
+                } else {
+                    Some(tuple)
+                }
+            })
+            .collect();
+        let collides = tuples
+            .iter()
+            .zip(seen.iter())
+            .any(|(tuple, seen_rows)| matches!(tuple, Some(t) if seen_rows.contains(t)));
+        if !collides {
+            for (tuple, seen_rows) in tuples.into_iter().zip(seen.iter_mut()) {
+                if let Some(t) = tuple {
+                    seen_rows.push(t);
+                }
+            }
+            return Ok(row);
+        }
+    }
+    Err(FeintError::Config(format!(
+        "table `{}` couldn't generate row {} without violating one of its own UNIQUE \
+         constraints after {MAX_UNIQUE_RETRY_ATTEMPTS} attempts — the referenced table(s) \
+         likely don't have enough distinct rows to fill it uniquely (increase their `rows:` \
+         in feint.yaml)",
+        table.id.qualified(),
+        row_index + 1,
+    )))
+}
+
 pub(crate) fn sql_cast_type(column: &Column) -> String {
     match &column.type_kind {
         crate::introspect::TypeKind::Array { elem_type } => format!("\"{elem_type}\"[]"),
@@ -542,18 +639,21 @@ pub(crate) async fn insert_plain_table(
         .unwrap_or(&empty);
 
     let columns = supplied_columns(table);
+    let key_sets = unique_key_index_sets(table, &columns);
+    let mut seen: Vec<Vec<Vec<PgValue>>> = vec![Vec::new(); key_sets.len()];
     let mut rows = Vec::with_capacity(planned_rows as usize);
     for i in 0..planned_rows {
-        let row_identity = i.to_string();
-        rows.push(generate_row(
+        rows.push(generate_unique_row(
             table,
             &columns,
-            &row_identity,
+            i as u64,
             &config.seed,
             overrides,
             skip_fk_columns,
             ref_pool,
             profile,
+            &key_sets,
+            &mut seen,
         )?);
     }
 
@@ -676,6 +776,14 @@ pub(crate) async fn insert_backfill_group(
     // Track the primary key values captured per table+row so the backfill
     // UPDATE can target each row precisely.
     let mut captured_pks: HashMap<TableId, Vec<Vec<PgValue>>> = HashMap::new();
+    // Full `RETURNING` rows (every unique-constraint column, by
+    // construction of `returning_columns`) + the column list they're
+    // indexed against — lets the backfill pass below check a freshly
+    // backfilled FK value against sibling unique-constraint columns whose
+    // values were already fixed in the initial insert (e.g. Listmonk's
+    // `roles` table: `list_id` is fixed up front, `parent_id` is
+    // backfilled after, and `UNIQUE (parent_id, list_id)` needs both).
+    let mut captured_returning: HashMap<TableId, (Vec<String>, Vec<Vec<PgValue>>)> = HashMap::new();
 
     for table_id in tables {
         let table = schema.table(table_id).expect("table exists");
@@ -692,18 +800,22 @@ pub(crate) async fn insert_backfill_group(
             .unwrap_or(&empty);
         let skip = skip_by_table.get(table_id).cloned().unwrap_or_default();
         let columns = supplied_columns(table);
+        let key_sets = unique_key_index_sets(table, &columns);
+        let mut seen: Vec<Vec<Vec<PgValue>>> = vec![Vec::new(); key_sets.len()];
 
         let mut rows = Vec::with_capacity(planned_rows as usize);
         for i in 0..planned_rows {
-            rows.push(generate_row(
+            rows.push(generate_unique_row(
                 table,
                 &columns,
-                &i.to_string(),
+                i as u64,
                 &config.seed,
                 overrides,
                 &skip,
                 ref_pool,
                 profile,
+                &key_sets,
+                &mut seen,
             )?);
         }
 
@@ -735,6 +847,7 @@ pub(crate) async fn insert_backfill_group(
             .map(|row| pk_indices.iter().map(|&i| row[i].clone()).collect())
             .collect();
         captured_pks.insert(table_id.clone(), pks);
+        captured_returning.insert(table_id.clone(), (returning, returned));
 
         progress(ProgressEvent::TableFinished {
             table: &table_id.qualified(),
@@ -751,17 +864,94 @@ pub(crate) async fn insert_backfill_group(
         let pks = captured_pks.get(&r.table).cloned().unwrap_or_default();
         let table_name = r.table.qualified();
 
+        // Unique constraints this backfilled FK actually participates in —
+        // its sibling columns' values are already fixed from the initial
+        // insert (captured in `returning`/`returned` above), so a
+        // collision on the *combination* only becomes checkable once this
+        // FK's real value is chosen here.
+        let (returning, returned) = captured_returning
+            .get(&r.table)
+            .cloned()
+            .unwrap_or_default();
+        let relevant_constraints: Vec<Vec<usize>> = table
+            .unique_constraints
+            .iter()
+            .filter(|uc| uc.columns.iter().any(|c| r.fk.columns.contains(c)))
+            .filter_map(|uc| {
+                uc.columns
+                    .iter()
+                    .map(|c| returning.iter().position(|ret| ret == c))
+                    .collect::<Option<Vec<usize>>>()
+            })
+            .collect();
+        let mut seen: Vec<Vec<Vec<PgValue>>> = vec![Vec::new(); relevant_constraints.len()];
+
         for (row_idx, pk) in pks.iter().enumerate() {
-            let mut rng = derive_rng(
-                &config.seed,
-                &SeedKey {
-                    table: &table_name,
-                    column: &r.fk.name,
-                    row_identity: &row_idx.to_string(),
-                },
-            );
-            let Some(tuple) = ref_pool.sample(&r.fk.ref_table, &r.fk.ref_columns, &mut rng) else {
-                continue; // pool empty (e.g. 0 rows configured upstream) — leave NULL
+            let mut tuple = None;
+            let mut pool_was_empty = false;
+            for attempt in 0..=MAX_UNIQUE_RETRY_ATTEMPTS {
+                let row_identity = if attempt == 0 {
+                    row_idx.to_string()
+                } else {
+                    format!("{row_idx}#retry{attempt}")
+                };
+                let mut rng = derive_rng(
+                    &config.seed,
+                    &SeedKey {
+                        table: &table_name,
+                        column: &r.fk.name,
+                        row_identity: &row_identity,
+                    },
+                );
+                let Some(candidate) = ref_pool.sample(&r.fk.ref_table, &r.fk.ref_columns, &mut rng)
+                else {
+                    pool_was_empty = true;
+                    break; // pool empty (e.g. 0 rows configured upstream) — leave NULL
+                };
+
+                let candidate_tuples: Vec<Vec<PgValue>> = relevant_constraints
+                    .iter()
+                    .map(|key| {
+                        key.iter()
+                            .map(|&i| {
+                                if let Some(pos) = r.fk.columns.iter().position(|c| {
+                                    returning.get(i).map(|ret| ret == c).unwrap_or(false)
+                                }) {
+                                    candidate[pos].clone()
+                                } else {
+                                    returned[row_idx][i].clone()
+                                }
+                            })
+                            .collect()
+                    })
+                    .collect();
+                let collides = candidate_tuples
+                    .iter()
+                    .zip(seen.iter())
+                    .any(|(t, s)| !t.iter().any(PgValue::is_null) && s.contains(t));
+                if !collides {
+                    for (t, s) in candidate_tuples.into_iter().zip(seen.iter_mut()) {
+                        if !t.iter().any(PgValue::is_null) {
+                            s.push(t);
+                        }
+                    }
+                    tuple = Some(candidate);
+                    break;
+                }
+            }
+            let Some(tuple) = tuple else {
+                if pool_was_empty {
+                    continue; // pool was empty — leave NULL, as before
+                }
+                return Err(FeintError::Config(format!(
+                    "table `{}` couldn't backfill foreign key `{}` for row {} without violating \
+                     one of its own UNIQUE constraints after {MAX_UNIQUE_RETRY_ATTEMPTS} attempts \
+                     — the referenced table(s) likely don't have enough distinct rows to fill it \
+                     uniquely (increase their `rows:` in feint.yaml)",
+                    r.table.qualified(),
+                    r.fk.name,
+                    row_idx + 1,
+                )));
             };
 
             let set_clause =

@@ -144,33 +144,30 @@ pub fn plan_insertion(schema: &Schema) -> Result<InsertPlan> {
             continue;
         }
 
-        let all_nullable = internal.iter().all(|r| {
+        // Only one nullable edge is needed to break a cycle — leave that
+        // edge NULL on first insert, insert everything else in the order
+        // its remaining (non-nullable) edges demand, then backfill the
+        // nullable edge. Requiring *every* edge to be nullable here would
+        // reject real, common patterns like a NOT NULL "primary child"
+        // pointer paired with a nullable back-reference (e.g. Immich's
+        // `stack.primaryAssetId` NOT NULL / `asset.stackId` nullable).
+        let is_edge_nullable = |r: &FkRef| {
             let table = schema.table(&r.table).expect("table exists");
             r.fk.columns
                 .iter()
                 .all(|col| table.column(col).map(|c| c.nullable).unwrap_or(false))
-        });
+        };
+        let (breakable, hard): (Vec<FkRef>, Vec<FkRef>) =
+            internal.into_iter().partition(is_edge_nullable);
 
-        if all_nullable {
-            groups.push(InsertGroup::Backfill {
-                tables,
-                null_then_backfill: internal,
-            });
-        } else {
+        if breakable.is_empty() {
             let table_names = tables
                 .iter()
                 .map(|t| t.qualified())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let constraint_names = internal
+            let constraint_names = hard
                 .iter()
-                .filter(|r| {
-                    let table = schema.table(&r.table).expect("table exists");
-                    !r.fk
-                        .columns
-                        .iter()
-                        .all(|col| table.column(col).map(|c| c.nullable).unwrap_or(false))
-                })
                 .map(|r| format!("{}.{}", r.table.qualified(), r.fk.name))
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -179,6 +176,49 @@ pub fn plan_insertion(schema: &Schema) -> Result<InsertPlan> {
                 constraints: constraint_names,
             });
         }
+
+        // Order the group by its remaining (hard) edges alone: a sub-DAG
+        // once the nullable edges are removed, in every real-world case
+        // seen so far. If it's somehow still cyclic (multiple independent
+        // hard sub-cycles sharing one nullable escape), that residual is
+        // genuinely unsatisfiable — surface it the same way as the
+        // no-nullable-edge-at-all case rather than silently mis-ordering.
+        let mut sub_graph: DiGraph<TableId, ()> = DiGraph::new();
+        let mut sub_node_of: HashMap<TableId, NodeIndex> = HashMap::new();
+        for t in &tables {
+            let idx = sub_graph.add_node(t.clone());
+            sub_node_of.insert(t.clone(), idx);
+        }
+        for r in &hard {
+            let parent = sub_node_of[&r.fk.ref_table];
+            let child = sub_node_of[&r.table];
+            sub_graph.add_edge(parent, child, ());
+        }
+        let Ok(sub_order) = toposort(&sub_graph, None) else {
+            let table_names = tables
+                .iter()
+                .map(|t| t.qualified())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let constraint_names = hard
+                .iter()
+                .map(|r| format!("{}.{}", r.table.qualified(), r.fk.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(FeintError::UnsatisfiableCycle {
+                tables: table_names,
+                constraints: constraint_names,
+            });
+        };
+        let ordered_tables: Vec<TableId> = sub_order
+            .into_iter()
+            .map(|n| sub_graph[n].clone())
+            .collect();
+
+        groups.push(InsertGroup::Backfill {
+            tables: ordered_tables,
+            null_then_backfill: breakable,
+        });
     }
 
     Ok(InsertPlan { groups })
@@ -294,6 +334,7 @@ mod tests {
             position: 1,
             type_name: "int4".to_string(),
             type_kind: TypeKind::Scalar,
+            max_length: None,
             nullable,
             identity: Identity::None,
             is_stored_generated: false,
@@ -426,5 +467,40 @@ mod tests {
         let schema = Schema { tables: vec![a, b] };
         let err = plan_insertion(&schema).unwrap_err();
         assert!(matches!(err, FeintError::UnsatisfiableCycle { .. }));
+    }
+
+    /// Real-world pattern (Immich's `stack`/`asset`, Mastodon's
+    /// `users`/`invites`): one NOT NULL edge paired with one nullable
+    /// back-reference. Only the nullable edge needs to break — the NOT
+    /// NULL side should resolve via normal insertion order, not push the
+    /// whole cycle into `UnsatisfiableCycle`.
+    #[test]
+    fn mixed_nullable_and_hard_cycle_resolves_via_backfill() {
+        let a = table(
+            "a",
+            vec![simple_column("id", false), simple_column("b_id", false)],
+            vec![fk("a_b_id_fkey", &["b_id"], "b", &["id"], false)],
+        );
+        let b = table(
+            "b",
+            vec![simple_column("id", false), simple_column("a_id", true)],
+            vec![fk("b_a_id_fkey", &["a_id"], "a", &["id"], false)],
+        );
+        let schema = Schema { tables: vec![a, b] };
+        let plan = plan_insertion(&schema).unwrap();
+        assert_eq!(plan.groups.len(), 1);
+        match &plan.groups[0] {
+            InsertGroup::Backfill {
+                tables,
+                null_then_backfill,
+            } => {
+                // `b` must come before `a`: `a`'s NOT NULL FK needs `b`'s
+                // row to already exist at insert time.
+                assert_eq!(tables, &[tid("b"), tid("a")]);
+                assert_eq!(null_then_backfill.len(), 1);
+                assert_eq!(null_then_backfill[0].fk.name, "b_a_id_fkey");
+            }
+            other => panic!("expected Backfill group, got {other:?}"),
+        }
     }
 }

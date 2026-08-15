@@ -579,8 +579,10 @@ If a table has CHECK constraints, `init` adds them as comments above that table 
 For each column, feint picks a generator in this order:
 
 1. An explicit `generator:` in `feint.yaml`, if you set one.
-2. A guess based on the column name. For example a column named `email` or containing `email` gets the email generator. A column ending in `_name` gets a person name generator.
+2. A guess based on the column name, but only if the column's declared type is text-like (`text`/`varchar`/`bpchar`/`citext`). For example a column named `email` or containing `email` gets the email generator. A column ending in `_name` gets a person name generator. A non-text column whose name happens to match (`is_email_verified boolean`, `email_flags integer`) falls through to the type-based guess instead, since the name heuristic only ever produces text.
 3. A guess based on the column type. A `uuid` column gets a UUID. An `int4` column gets a random integer. A `timestamptz` column gets a random recent timestamp. And so on.
+
+A generated text value that's too long for a `varchar(N)`/`bpchar(N)` column is truncated to fit, rather than left for Postgres to reject.
 
 If none of these apply and the column type is one feint does not understand, and the column is `NOT NULL`, `up` fails with a clear error naming the column. You then add an explicit `generator:` override for it.
 
@@ -599,6 +601,10 @@ feint builds a dependency graph from your foreign keys and inserts tables in the
 ### Composite foreign keys
 
 If a foreign key spans more than one column, feint samples a full matching row from the referenced table, not each column independently. This avoids generating column combinations that never actually appeared together.
+
+### Foreign keys under a UNIQUE constraint
+
+If a table has a `UNIQUE` constraint (single-column or composite, including a bare `CREATE UNIQUE INDEX` with no backing constraint) over one or more foreign key columns, feint retries a colliding row with a different sampled value instead of letting Postgres reject it on a duplicate-key error. If the referenced table doesn't have enough distinct rows to fill the constraint without a collision, `up` fails with a clear error telling you to increase `rows:` on the referenced table.
 
 ### Self references and cycles
 

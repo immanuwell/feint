@@ -57,6 +57,10 @@ pub struct Column {
     pub position: i16,
     pub type_name: String,
     pub type_kind: TypeKind,
+    /// `character_maximum_length` for `varchar(N)`/`char(N)`/`bpchar(N)` —
+    /// `None` for unbounded `text`/`citext` and every other type. Generators
+    /// use this to truncate rather than overflow the column.
+    pub max_length: Option<i32>,
     pub nullable: bool,
     pub identity: Identity,
     /// `GENERATED ALWAYS AS (...) STORED` — never written by feint.
@@ -217,7 +221,8 @@ async fn list_columns(
                     t.oid, t.typname, t.typtype, t.typcategory, t.typbasetype, \
                     bt.typname AS base_typname, et.typname AS elem_typname, \
                     (SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d \
-                       WHERE d.adrelid = a.attrelid AND d.adnum = a.attnum) AS default_expr \
+                       WHERE d.adrelid = a.attrelid AND d.adnum = a.attnum) AS default_expr, \
+                    a.atttypmod \
              FROM pg_attribute a \
              JOIN pg_type t ON t.oid = a.atttypid \
              LEFT JOIN pg_type bt ON bt.oid = t.typbasetype \
@@ -243,6 +248,15 @@ async fn list_columns(
         let base_typname: Option<String> = row.get(10);
         let elem_typname: Option<String> = row.get(11);
         let default_expr: Option<String> = row.get(12);
+        let typmod: i32 = row.get(13);
+        // `atttypmod` for varchar(N)/bpchar(N) is N + 4 (VARHDRSZ); -1
+        // means unbounded (plain `text`/`citext`, or `varchar` with no
+        // length given).
+        let max_length = if typmod > 0 && matches!(type_name.as_str(), "varchar" | "bpchar") {
+            Some(typmod - 4)
+        } else {
+            None
+        };
 
         let identity = match identity_char as u8 as char {
             'a' => Identity::Always,
@@ -281,6 +295,7 @@ async fn list_columns(
             position,
             type_name,
             type_kind,
+            max_length,
             nullable: !not_null,
             identity,
             is_stored_generated,
@@ -315,7 +330,7 @@ async fn list_unique_constraints(client: &Client, table_oid: u32) -> Result<Vec<
         )
         .await?;
 
-    Ok(rows
+    let mut constraints: Vec<UniqueConstraint> = rows
         .into_iter()
         .map(|row| {
             let contype: i8 = row.get(1);
@@ -325,7 +340,54 @@ async fn list_unique_constraints(client: &Client, table_oid: u32) -> Result<Vec<
                 columns: row.get(2),
             }
         })
-        .collect())
+        .collect();
+
+    // A bare `CREATE UNIQUE INDEX` (no `ADD CONSTRAINT`) enforces
+    // uniqueness exactly like a real unique constraint but leaves no
+    // `pg_constraint` row — extremely common in Rails/TypeORM/Django-style
+    // migrations (e.g. Listmonk's `idx_roles`, Mastodon's `idx_on_account_
+    // id_target_account_id_...`). Missing these meant feint had no idea
+    // these column combinations needed to stay unique. Two kinds are
+    // excluded: partial indexes (`indpred IS NOT NULL`), which only
+    // constrain rows matching their predicate rather than the whole table;
+    // and expression indexes (`indexprs IS NOT NULL`, e.g. Listmonk's
+    // `idx_subs_email ON (lower(email))`), whose key isn't a plain column
+    // at all — `indkey` reports a `0` placeholder for an expression key,
+    // which resolves to no real column and would otherwise be
+    // misread as a (wrongly always-colliding) empty column list.
+    let index_rows = client
+        .query(
+            "SELECT ci.relname, \
+                    array(SELECT attname FROM pg_attribute \
+                           WHERE attrelid = i.indrelid AND attnum = ANY(i.indkey::smallint[]) \
+                           ORDER BY array_position(i.indkey::smallint[], attnum)) AS columns \
+             FROM pg_index i \
+             JOIN pg_class ci ON ci.oid = i.indexrelid \
+             WHERE i.indrelid = $1 AND i.indisunique \
+               AND i.indpred IS NULL AND i.indexprs IS NULL \
+               AND NOT EXISTS (SELECT 1 FROM pg_constraint c \
+                                WHERE c.conindid = i.indexrelid AND c.contype IN ('u', 'p'))",
+            &[&table_oid],
+        )
+        .await?;
+    // A primary key always has a backing `pg_constraint` row in Postgres —
+    // there's no way to create one via a bare index — so every row here
+    // (already filtered to "no backing constraint") is a plain unique
+    // index, never a primary key.
+    constraints.extend(index_rows.into_iter().map(|row| UniqueConstraint {
+        name: row.get(0),
+        is_primary: false,
+        columns: row.get(1),
+    }));
+
+    // Belt-and-suspenders: a constraint with no resolvable plain columns
+    // (expression/exotic-key cases the query above doesn't already
+    // exclude) is worse than useless downstream — every row's "value" for
+    // it is the same empty tuple, so consumers that check for uniqueness
+    // by comparing tuples would see every row as a false collision.
+    constraints.retain(|c| !c.columns.is_empty());
+
+    Ok(constraints)
 }
 
 async fn list_foreign_keys(client: &Client, table_oid: u32) -> Result<Vec<ForeignKey>> {

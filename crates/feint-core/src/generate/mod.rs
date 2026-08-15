@@ -47,13 +47,54 @@ pub fn generate_value(
     override_generator: Option<&str>,
     rng: &mut ChaCha8Rng,
 ) -> Result<PgValue> {
-    if let Some(name) = override_generator {
-        return dispatch_named(name, column, rng);
+    let heuristic_name = name_heuristic(&column.name).filter(|_| is_text_like(column));
+    let value = if let Some(name) = override_generator {
+        dispatch_named(name, column, rng)?
+    } else if let Some(name) = heuristic_name {
+        // The name heuristic (email/phone/person-name) only ever produces
+        // text. A column whose *name* happens to match (e.g. Chatwoot's
+        // `email_flags integer`, Twenty's `isEmailVerified boolean`) but
+        // whose declared type isn't text-like would get a value Postgres
+        // can't even parse into that type — `is_text_like` above skips the
+        // heuristic in that case, falling through to the type dispatch.
+        dispatch_named(name, column, rng)?
+    } else {
+        dispatch_by_type(&column.type_name, &column.type_kind, column.nullable, rng)?
+    };
+    Ok(truncate_to_column_length(value, column))
+}
+
+/// True if `column`'s declared type is one whose wire format is plain text
+/// (so the name-heuristic generators, which only ever produce
+/// [`PgValue::Text`], are actually valid for it). Domains are checked one
+/// level down via their base type, matching [`dispatch_by_type`]'s own
+/// single-level domain handling.
+fn is_text_like(column: &Column) -> bool {
+    let is_text_type_name = |name: &str| matches!(name, "text" | "varchar" | "bpchar" | "citext");
+    match &column.type_kind {
+        TypeKind::Scalar => is_text_type_name(&column.type_name),
+        TypeKind::Domain { base_type } => is_text_type_name(base_type),
+        _ => false,
     }
-    if let Some(name) = name_heuristic(&column.name) {
-        return dispatch_named(name, column, rng);
+}
+
+/// `varchar(N)`/`bpchar(N)` columns reject a value longer than `N`
+/// characters. Every text-producing generator (name-heuristic or
+/// type-fallback `lorem_word`) can produce a value that overshoots a
+/// narrow real-world column (e.g. Gitea's `webhook.type varchar(16)`), so
+/// truncation is applied once, uniformly, after generation rather than
+/// inside each individual generator.
+fn truncate_to_column_length(value: PgValue, column: &Column) -> PgValue {
+    let Some(max_length) = column.max_length else {
+        return value;
+    };
+    let max_length = max_length.max(0) as usize;
+    match value {
+        PgValue::Text(s) if s.chars().count() > max_length => {
+            PgValue::Text(s.chars().take(max_length).collect())
+        }
+        other => other,
     }
-    dispatch_by_type(&column.type_name, &column.type_kind, column.nullable, rng)
 }
 
 /// Column-name based heuristic: only fires for name patterns that are a
@@ -230,6 +271,7 @@ fn placeholder_column(type_name: &str, nullable: bool) -> Column {
         position: 0,
         type_name: type_name.to_string(),
         type_kind: TypeKind::Scalar,
+        max_length: None,
         nullable,
         identity: crate::introspect::Identity::None,
         is_stored_generated: false,
@@ -338,6 +380,7 @@ mod tests {
             position: 1,
             type_name: "text".to_string(),
             type_kind: TypeKind::Scalar,
+            max_length: None,
             nullable: false,
             identity: Identity::None,
             is_stored_generated: false,
@@ -440,6 +483,75 @@ mod tests {
     fn detect_sensitive_json_keys_ignores_array_elements() {
         let value = serde_json::json!({ "tags": ["email", "phone"] });
         assert!(detect_sensitive_json_keys(&value, 2).is_empty());
+    }
+
+    /// Real-world regression (Chatwoot's `email_flags integer`, Twenty's
+    /// `isEmailVerified boolean`): a column name matching the email/phone/
+    /// name heuristic but declared as a non-text type must fall through to
+    /// the type-based generator instead of producing a value the column's
+    /// real type can't hold.
+    #[test]
+    fn name_heuristic_is_skipped_for_a_non_text_column() {
+        let col = Column {
+            type_name: "bool".to_string(),
+            ..text_column("is_email_verified")
+        };
+        let mut rng = derive_rng(
+            "seed",
+            &SeedKey {
+                table: "t",
+                column: "is_email_verified",
+                row_identity: "0",
+            },
+        );
+        let v = generate_value(&col, None, &mut rng).unwrap();
+        assert!(matches!(v, PgValue::Bool(_)), "expected Bool, got {v:?}");
+    }
+
+    #[test]
+    fn name_heuristic_still_applies_to_a_real_text_column() {
+        let col = text_column("user_email");
+        let mut rng = derive_rng(
+            "seed",
+            &SeedKey {
+                table: "t",
+                column: "user_email",
+                row_identity: "0",
+            },
+        );
+        let v = generate_value(&col, None, &mut rng).unwrap();
+        match v {
+            PgValue::Text(s) => assert!(s.contains('@'), "expected an email-shaped value"),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    /// Real-world regression (Gitea's `webhook.type varchar(16)`,
+    /// Vaultwarden's `email_new_token varchar(16)`): any text generator can
+    /// overshoot a narrow declared length; the result must be truncated to
+    /// fit, not handed to Postgres to reject.
+    #[test]
+    fn generated_text_is_truncated_to_the_column_max_length() {
+        let col = Column {
+            type_name: "varchar".to_string(),
+            max_length: Some(16),
+            ..text_column("user_email")
+        };
+        let mut rng = derive_rng(
+            "seed",
+            &SeedKey {
+                table: "t",
+                column: "user_email",
+                row_identity: "0",
+            },
+        );
+        let v = generate_value(&col, None, &mut rng).unwrap();
+        match v {
+            PgValue::Text(s) => {
+                assert!(s.chars().count() <= 16, "value {s:?} exceeds max_length 16")
+            }
+            other => panic!("expected Text, got {other:?}"),
+        }
     }
 
     #[test]
