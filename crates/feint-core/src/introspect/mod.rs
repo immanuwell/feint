@@ -66,6 +66,9 @@ pub struct Column {
     /// `None` for unbounded `text`/`citext` and every other type. Generators
     /// use this to truncate rather than overflow the column.
     pub max_length: Option<i32>,
+    /// Declared dimension for pgvector's `vector(N)` type. `None` for an
+    /// unconstrained vector and every non-vector type.
+    pub vector_dimensions: Option<i32>,
     pub nullable: bool,
     pub identity: Identity,
     /// `GENERATED ALWAYS AS (...) STORED` — never written by feint.
@@ -88,6 +91,54 @@ impl Column {
         self.is_stored_generated
             || matches!(self.identity, Identity::Always)
             || self.is_serial_default
+    }
+}
+
+/// Build the SELECT expression used to read a column into `PgValue`.
+///
+/// PostgreSQL returns binary values by default. `PgValue` has real binary
+/// decoders for the common scalar types below, enums, and arrays composed of
+/// those types. For everything else, ask PostgreSQL for its canonical text
+/// representation instead of interpreting an opaque binary payload as UTF-8.
+/// That text can be fed back into a column of the original type.
+pub(crate) fn select_column_expression(column: &Column) -> String {
+    let quoted = format!("\"{}\"", column.name);
+    if has_binary_decoder(&column.type_name, &column.type_kind) {
+        quoted
+    } else {
+        format!("{quoted}::text AS {quoted}")
+    }
+}
+
+fn has_binary_decoder(type_name: &str, type_kind: &TypeKind) -> bool {
+    match type_kind {
+        TypeKind::Enum(_) => true,
+        TypeKind::Array {
+            elem_type,
+            elem_kind,
+        } => has_binary_decoder(elem_type, elem_kind),
+        TypeKind::Scalar => matches!(
+            type_name,
+            "bool"
+                | "int2"
+                | "int4"
+                | "int8"
+                | "numeric"
+                | "float4"
+                | "float8"
+                | "text"
+                | "varchar"
+                | "bpchar"
+                | "name"
+                | "bytea"
+                | "uuid"
+                | "timestamp"
+                | "timestamptz"
+                | "date"
+                | "json"
+                | "jsonb"
+        ),
+        TypeKind::Domain { .. } | TypeKind::Composite | TypeKind::Other => false,
     }
 }
 
@@ -270,6 +321,11 @@ async fn list_columns(
         } else {
             None
         };
+        let vector_dimensions = if typmod > 0 && type_name == "vector" {
+            Some(typmod)
+        } else {
+            None
+        };
 
         let identity = match identity_char as u8 as char {
             'a' => Identity::Always,
@@ -334,6 +390,7 @@ async fn list_columns(
             type_name,
             type_kind,
             max_length,
+            vector_dimensions,
             nullable: !not_null,
             identity,
             is_stored_generated,

@@ -58,6 +58,11 @@ pub fn generate_value(
         // can't even parse into that type — `is_text_like` above skips the
         // heuristic in that case, falling through to the type dispatch.
         dispatch_named(name, column, rng)?
+    } else if matches!(column.type_kind, TypeKind::Scalar) {
+        // Keep the real column context for scalar generators. Some scalar
+        // extension types carry useful typmod metadata on the column itself
+        // (for example pgvector's `vector(512)` dimension).
+        dispatch_named(scalar_type_generator(&column.type_name), column, rng)?
     } else {
         dispatch_by_type(&column.type_name, &column.type_kind, column.nullable, rng)?
     };
@@ -275,6 +280,7 @@ fn placeholder_column(type_name: &str, nullable: bool) -> Column {
         type_name: type_name.to_string(),
         type_kind: TypeKind::Scalar,
         max_length: None,
+        vector_dimensions: None,
         nullable,
         identity: crate::introspect::Identity::None,
         is_stored_generated: false,
@@ -283,7 +289,7 @@ fn placeholder_column(type_name: &str, nullable: bool) -> Column {
     }
 }
 
-fn scalar_type_generator(type_name: &str) -> &'static str {
+fn scalar_type_generator(type_name: &str) -> &str {
     match type_name {
         "bool" => "bool",
         "int2" => "int2_range",
@@ -300,6 +306,8 @@ fn scalar_type_generator(type_name: &str) -> &'static str {
         "bytea" => "bytea",
         "inet" | "cidr" => "inet",
         "tsvector" => "tsvector",
+        "point" | "line" | "lseg" | "box" | "path" | "polygon" | "circle" => type_name,
+        "vector" => "vector",
         _ => "lorem_word",
     }
 }
@@ -380,6 +388,52 @@ fn dispatch_named(name: &str, column: &Column, rng: &mut ChaCha8Rng) -> Result<P
             // lexeme-and-position syntax is parsed correctly.
             PgValue::Raw(lexemes.join(" "))
         }
+        "point" => PgValue::Raw(random_point_literal(rng)),
+        "line" => {
+            let a = rng.gen_range(0.1..100.0f64);
+            let b = rng.gen_range(0.1..100.0f64);
+            let c = rng.gen_range(-100.0..100.0f64);
+            PgValue::Raw(format!("{{{a:.4},{b:.4},{c:.4}}}"))
+        }
+        "lseg" => PgValue::Raw(format!(
+            "[{},{}]",
+            random_point_literal(rng),
+            random_point_literal(rng)
+        )),
+        "box" => PgValue::Raw(format!(
+            "({}, {})",
+            random_point_literal(rng),
+            random_point_literal(rng)
+        )),
+        "path" => PgValue::Raw(format!(
+            "[{},{},{}]",
+            random_point_literal(rng),
+            random_point_literal(rng),
+            random_point_literal(rng)
+        )),
+        "polygon" => {
+            let x = rng.gen_range(-100.0..100.0f64);
+            let y = rng.gen_range(-100.0..100.0f64);
+            let width = rng.gen_range(0.1..25.0f64);
+            let height = rng.gen_range(0.1..25.0f64);
+            PgValue::Raw(format!(
+                "(({x:.4},{y:.4}),({:.4},{y:.4}),({x:.4},{:.4}))",
+                x + width,
+                y + height
+            ))
+        }
+        "circle" => PgValue::Raw(format!(
+            "<{},{}>",
+            random_point_literal(rng),
+            rng.gen_range(0.1..25.0f64)
+        )),
+        "vector" => {
+            let dimensions = column.vector_dimensions.unwrap_or(3).max(1) as usize;
+            let values = (0..dimensions)
+                .map(|_| format!("{:.6}", rng.gen_range(-1.0..1.0f64)))
+                .collect::<Vec<_>>();
+            PgValue::Raw(format!("[{}]", values.join(",")))
+        }
         other => {
             return Err(FeintError::Generation(format!(
                 "unknown generator `{other}` for column `{}`",
@@ -387,6 +441,12 @@ fn dispatch_named(name: &str, column: &Column, rng: &mut ChaCha8Rng) -> Result<P
             )))
         }
     })
+}
+
+fn random_point_literal(rng: &mut ChaCha8Rng) -> String {
+    let x = rng.gen_range(-180.0..180.0f64);
+    let y = rng.gen_range(-90.0..90.0f64);
+    format!("({x:.4},{y:.4})")
 }
 
 fn random_datetime(rng: &mut ChaCha8Rng) -> DateTime<Utc> {
@@ -409,6 +469,7 @@ mod tests {
             type_name: "text".to_string(),
             type_kind: TypeKind::Scalar,
             max_length: None,
+            vector_dimensions: None,
             nullable: false,
             identity: Identity::None,
             is_stored_generated: false,
@@ -504,6 +565,37 @@ mod tests {
             PgValue::Raw(vector) => {
                 assert!(!vector.is_empty());
                 assert!(vector.contains(":"), "expected positioned lexemes");
+            }
+            other => panic!("expected Raw, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn vector_generator_honors_the_declared_dimension() {
+        let col = Column {
+            type_name: "vector".to_string(),
+            vector_dimensions: Some(4),
+            ..text_column("embedding")
+        };
+        let mut rng = derive_rng(
+            "seed",
+            &SeedKey {
+                table: "face_search",
+                column: "embedding",
+                row_identity: "0",
+            },
+        );
+        let value = generate_value(&col, None, &mut rng).unwrap();
+        match value {
+            PgValue::Raw(vector) => {
+                let values = vector
+                    .strip_prefix('[')
+                    .and_then(|v| v.strip_suffix(']'))
+                    .expect("bracketed vector")
+                    .split(',')
+                    .collect::<Vec<_>>();
+                assert_eq!(values.len(), 4);
+                assert!(values.iter().all(|value| value.parse::<f64>().is_ok()));
             }
             other => panic!("expected Raw, got {other:?}"),
         }

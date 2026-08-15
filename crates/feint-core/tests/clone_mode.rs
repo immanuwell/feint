@@ -159,6 +159,59 @@ async fn full_unmasked_clone_preserves_keys_and_resyncs_sequences() {
 }
 
 #[tokio::test]
+async fn clone_round_trips_binary_and_text_fallback_types_without_utf8_corruption() {
+    let ddl = "
+        CREATE TABLE wire_values (
+            id serial PRIMARY KEY,
+            payload bytea NOT NULL,
+            address inet NOT NULL,
+            search tsvector NOT NULL,
+            area polygon NOT NULL
+        );
+    ";
+    let mut db = CloneFixture::setup("clone_wire_values", ddl, ddl).await;
+    db.source_client
+        .batch_execute(
+            "INSERT INTO wire_values (payload, address, search, area) VALUES (
+                decode('00ff8041', 'hex'),
+                '192.0.2.16/28',
+                '''alpha'':1A ''beta'':2',
+                '((0,0),(4,0),(0,3))'
+            );",
+        )
+        .await
+        .unwrap();
+
+    let schema = db.introspect_source().await;
+    let config = config_with(
+        &format!("{}.wire_values", db.schema_name),
+        vec![("address", MaskStrategy::None)],
+    );
+    let summary = db
+        .clone(&schema, &config)
+        .await
+        .expect("opaque binary types should clone through canonical text");
+    assert_eq!(summary.total_rows, 1);
+
+    let schema_name = &db.schema_name;
+    let row = db
+        .target_client
+        .query_one(
+            &format!(
+                "SELECT encode(payload, 'hex'), address::text, search::text, area::text \
+                 FROM \"{schema_name}\".wire_values"
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>(0), "00ff8041");
+    assert_eq!(row.get::<_, String>(1), "192.0.2.16/28");
+    assert_eq!(row.get::<_, String>(2), "'alpha':1A 'beta':2");
+    assert_eq!(row.get::<_, String>(3), "((0,0),(4,0),(0,3))");
+}
+
+#[tokio::test]
 async fn masked_clone_applies_each_strategy() {
     let mut db = CloneFixture::setup("masked_strategies", USERS_ORDERS_DDL, USERS_ORDERS_DDL).await;
     db.source_client

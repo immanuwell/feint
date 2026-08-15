@@ -20,7 +20,7 @@ use tokio_postgres::Transaction;
 
 use crate::clone::clone_supplied_columns;
 use crate::error::{FeintError, Result};
-use crate::introspect::{Column, Schema, Table, TableId};
+use crate::introspect::{select_column_expression, Column, Schema, Table, TableId};
 use crate::mask::row_identity_key;
 use crate::value::PgValue;
 
@@ -124,7 +124,7 @@ async fn fetch_rows_where(
 ) -> Result<Vec<Vec<PgValue>>> {
     let col_list = columns
         .iter()
-        .map(|c| format!("\"{}\"", c.name))
+        .map(|c| select_column_expression(c))
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
@@ -168,7 +168,7 @@ async fn fetch_rows_matching(
 
     let col_list = columns
         .iter()
-        .map(|c| format!("\"{}\"", c.name))
+        .map(|c| select_column_expression(c))
         .collect::<Vec<_>>()
         .join(", ");
     let match_list = match_columns
@@ -403,6 +403,7 @@ mod tests {
                 type_name: "int4".to_string(),
                 type_kind: TypeKind::Scalar,
                 max_length: None,
+                vector_dimensions: None,
                 nullable: false,
                 identity: Identity::None,
                 is_stored_generated: false,

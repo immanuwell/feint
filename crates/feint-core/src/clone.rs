@@ -19,7 +19,7 @@ use crate::config::{FeintConfig, TableStrategy};
 use crate::error::{FeintError, Result};
 use crate::graph::{FkRef, InsertGroup, InsertPlan};
 use crate::insert::{self, sql_cast_type, RefPool};
-use crate::introspect::{Column, Identity, Schema, Table, TableId};
+use crate::introspect::{select_column_expression, Column, Identity, Schema, Table, TableId};
 use crate::mask::{self, validate_masking_config};
 use crate::subset::SubsetRows;
 use crate::value::PgValue;
@@ -70,7 +70,7 @@ pub(crate) async fn read_table_rows(
 
     let col_list = columns
         .iter()
-        .map(|c| format!("\"{}\"", c.name))
+        .map(|c| select_column_expression(c))
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(

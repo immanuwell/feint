@@ -266,6 +266,7 @@ mod tests {
             type_name: "text".to_string(),
             type_kind: TypeKind::Scalar,
             max_length: None,
+            vector_dimensions: None,
             nullable: true,
             identity: crate::introspect::Identity::None,
             is_stored_generated: false,

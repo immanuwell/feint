@@ -335,6 +335,7 @@ mod tests {
             type_name: "int4".to_string(),
             type_kind: TypeKind::Scalar,
             max_length: None,
+            vector_dimensions: None,
             nullable,
             identity: Identity::None,
             is_stored_generated: false,

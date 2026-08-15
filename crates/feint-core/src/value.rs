@@ -195,7 +195,15 @@ impl ToSql for PgValue {
 
     fn encode_format(&self, _ty: &Type) -> postgres_types::Format {
         match self {
-            PgValue::Array(_) | PgValue::Enum(..) | PgValue::Raw(_) => postgres_types::Format::Text,
+            // Text is also used as the carrier when a SELECT explicitly
+            // casts an opaque PostgreSQL type to its canonical text output.
+            // Sending it back in text format lets the destination type's
+            // input function parse it; labeling those bytes as that type's
+            // binary format would recreate the corruption we avoided while
+            // reading it.
+            PgValue::Text(_) | PgValue::Array(_) | PgValue::Enum(..) | PgValue::Raw(_) => {
+                postgres_types::Format::Text
+            }
             _ => postgres_types::Format::Binary,
         }
     }

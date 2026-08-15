@@ -207,6 +207,48 @@ async fn referenced_server_assigned_only_table_populates_the_fk_pool() {
 }
 
 #[tokio::test]
+async fn geometric_columns_receive_valid_values_for_every_builtin_type() {
+    let mut db = TestDb::setup(
+        "geometric_types",
+        "CREATE TABLE geometry_samples (\
+             id serial PRIMARY KEY, \
+             location point NOT NULL, \
+             boundary line NOT NULL, \
+             segment lseg NOT NULL, \
+             bounds box NOT NULL, \
+             route path NOT NULL, \
+             area polygon NOT NULL, \
+             radius circle NOT NULL\
+         ); \
+         CREATE TABLE geometry_references (\
+             id serial PRIMARY KEY, \
+             sample_id integer NOT NULL REFERENCES geometry_samples(id)\
+         );",
+    )
+    .await;
+    let schema = db.introspect().await;
+
+    let summary = db.generate(&schema, 20).await;
+    assert_eq!(summary.total_rows, 40);
+    let actual: i64 = db
+        .client
+        .query_one(
+            &format!(
+                "SELECT count(*) FROM \"{}\".geometry_samples \
+                 WHERE location IS NOT NULL AND boundary IS NOT NULL \
+                   AND segment IS NOT NULL AND bounds IS NOT NULL \
+                   AND route IS NOT NULL AND area IS NOT NULL AND radius IS NOT NULL",
+                db.schema_name
+            ),
+            &[],
+        )
+        .await
+        .expect("query generated geometric values")
+        .get(0);
+    assert_eq!(actual, 20);
+}
+
+#[tokio::test]
 async fn check_constraints_are_introspected_and_annotated_in_yaml() {
     let db = TestDb::setup(
         "check_constraints",

@@ -22,7 +22,9 @@ use tokio_postgres::{Client, Transaction};
 use crate::config::FeintConfig;
 use crate::error::{FeintError, Result};
 use crate::insert::sql_cast_type;
-use crate::introspect::{Schema, Table, TableId, MASK_CHECKPOINT_TABLE as CHECKPOINT_TABLE};
+use crate::introspect::{
+    select_column_expression, Schema, Table, TableId, MASK_CHECKPOINT_TABLE as CHECKPOINT_TABLE,
+};
 use crate::mask::{self, validate_masking_config, JsonPathRules, MaskStrategy};
 use crate::value::PgValue;
 
@@ -302,7 +304,7 @@ async fn fetch_batch(
         .collect();
     let col_list = select_cols
         .iter()
-        .map(|c| format!("\"{c}\""))
+        .map(|c| select_column_expression(table.column(c).expect("selected column exists")))
         .collect::<Vec<_>>()
         .join(", ");
     let order_list = pk_cols

@@ -155,6 +155,22 @@ fn config_with_rows(schema_name: &str, tables: &[String], rows: u32) -> FeintCon
 
 #[tokio::test]
 async fn real_world_schemas_survive_feints_full_command_surface() {
+    let fixture_filter = std::env::var("FEINT_REAL_WORLD_FIXTURE").ok();
+    let fixtures = FIXTURES
+        .iter()
+        .filter(|fixture| {
+            fixture_filter
+                .as_deref()
+                .is_none_or(|name| fixture.name == name)
+        })
+        .collect::<Vec<_>>();
+    if let Some(name) = fixture_filter.as_deref() {
+        assert!(
+            !fixtures.is_empty(),
+            "unknown FEINT_REAL_WORLD_FIXTURE `{name}`"
+        );
+    }
+
     let container: ContainerAsync<GenericImage> = GenericImage::new(
         "ghcr.io/immich-app/postgres",
         "16-vectorchord0.4.3-pgvectors0.3.0",
@@ -181,7 +197,7 @@ async fn real_world_schemas_survive_feints_full_command_surface() {
 
     let mut reports: Vec<(&str, FixtureReport)> = Vec::new();
 
-    for fixture in FIXTURES {
+    for fixture in &fixtures {
         println!("\n=== {} ===", fixture.name);
         let mut report = FixtureReport::default();
         let source_db = format!("real_world_{}_src", fixture.name);
@@ -297,6 +313,7 @@ async fn real_world_schemas_survive_feints_full_command_surface() {
                 seed: "real-world".to_string(),
                 tables: BTreeMap::new(),
             };
+            let mut clone_table = None;
             match clone::run(
                 &source_ro,
                 &target_txn,
@@ -304,7 +321,14 @@ async fn real_world_schemas_survive_feints_full_command_surface() {
                 &plan,
                 &empty_config,
                 None,
-                |_| {},
+                |event| match event {
+                    clone::ProgressEvent::TableStarted { table } => {
+                        clone_table = Some(table.to_string());
+                    }
+                    clone::ProgressEvent::TableFinished { .. } => {
+                        clone_table = None;
+                    }
+                },
             )
             .await
             {
@@ -318,7 +342,10 @@ async fn real_world_schemas_survive_feints_full_command_surface() {
                 Err(e) => {
                     target_txn.rollback().await.ok();
                     source_ro.rollback().await.ok();
-                    let msg = format!("{e}");
+                    let msg = match clone_table {
+                        Some(table) => format!("{e} while cloning `{table}`"),
+                        None => format!("{e}"),
+                    };
                     println!("  ✗ clone: {msg}");
                     report.clone = Some(Err(msg));
                 }
@@ -424,7 +451,7 @@ async fn real_world_schemas_survive_feints_full_command_surface() {
     } else {
         println!(
             "\nAll {} real-world schemas passed generate, clone, and mask cleanly.",
-            FIXTURES.len()
+            fixtures.len()
         );
     }
 }
