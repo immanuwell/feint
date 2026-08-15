@@ -420,6 +420,29 @@ fn unique_key_index_sets(table: &Table, columns: &[&Column]) -> Vec<Vec<usize>> 
         .collect()
 }
 
+/// Same as [`unique_key_index_sets`], additionally dropping any constraint
+/// that touches a column in `skip` — used for a deferred FK cycle's first
+/// generation pass, where cyclic columns are still NULL and can't be
+/// meaningfully checked for a collision yet (they're resolved in pass 2,
+/// same as the primary key there already is).
+fn unique_key_index_sets_excluding(
+    table: &Table,
+    columns: &[&Column],
+    skip: &HashSet<String>,
+) -> Vec<Vec<usize>> {
+    table
+        .unique_constraints
+        .iter()
+        .filter(|uc| !uc.columns.iter().any(|c| skip.contains(c)))
+        .filter_map(|uc| {
+            uc.columns
+                .iter()
+                .map(|c| columns.iter().position(|col| &col.name == c))
+                .collect::<Option<Vec<usize>>>()
+        })
+        .collect()
+}
+
 /// Generate one row, retrying with a different derived seed if it collides
 /// with an already-generated row of the same batch on any of `table`'s
 /// UNIQUE constraints. Plain per-row-independent `RefPool` sampling has no
@@ -1115,18 +1138,28 @@ pub(crate) async fn insert_deferred_group(
             .unwrap_or(&empty);
         let columns = supplied_columns(table);
         let skip = cyclic_columns.get(table_id).cloned().unwrap_or_default();
+        // A non-cyclic FK on a table in this group (e.g. Baserow's
+        // `automation_automationnode.service_id`, UNIQUE and DEFERRABLE
+        // but pointing outside the cycle) still goes through plain
+        // `RefPool` sampling here, which samples with replacement — so it
+        // needs the same collision-retry protection `insert_plain_table`
+        // gives ordinary tables, or a UNIQUE FK can silently collide.
+        let key_sets = unique_key_index_sets_excluding(table, &columns, &skip);
+        let mut seen: Vec<Vec<Vec<PgValue>>> = vec![Vec::new(); key_sets.len()];
 
         let mut rows = Vec::with_capacity(planned_rows as usize);
         for i in 0..planned_rows {
-            rows.push(generate_row(
+            rows.push(generate_unique_row(
                 table,
                 &columns,
-                &i.to_string(),
+                i as u64,
                 &config.seed,
                 overrides,
                 &skip,
                 ref_pool,
                 profile,
+                &key_sets,
+                &mut seen,
             )?);
         }
 
@@ -1166,25 +1199,98 @@ pub(crate) async fn insert_deferred_group(
         let skip = cyclic_columns.get(table_id).cloned().unwrap_or_default();
         let table_name = table_id.qualified();
 
-        for (row_idx, row) in rows.iter_mut().enumerate() {
-            for fk in &table.foreign_keys {
-                if !fk.columns.iter().any(|c| skip.contains(c)) {
-                    continue;
-                }
-                let mut rng = derive_rng(
-                    &config.seed,
-                    &SeedKey {
-                        table: &table_name,
-                        column: &fk.name,
-                        row_identity: &row_idx.to_string(),
-                    },
-                );
-                let tuple = ref_pool.sample(&fk.ref_table, &fk.ref_columns, &mut rng);
-                if let Some(tuple) = tuple {
-                    for (col_name, val) in fk.columns.iter().zip(tuple) {
-                        if let Some(pos) = columns.iter().position(|c| &c.name == col_name) {
-                            row[pos] = val;
+        for fk in &table.foreign_keys {
+            if !fk.columns.iter().any(|c| skip.contains(c)) {
+                continue;
+            }
+            // Same collision-avoidance `insert_backfill_group` already
+            // does for its own cyclic-edge resolution: plain `RefPool`
+            // sampling has no way to know about sibling rows, so a UNIQUE
+            // cyclic FK (e.g. Baserow's `builder_builder.login_page_id`,
+            // 1:1 with `builder_page`) can otherwise collide at random.
+            let key_sets: Vec<Vec<usize>> = table
+                .unique_constraints
+                .iter()
+                .filter(|uc| uc.columns.iter().any(|c| fk.columns.contains(c)))
+                .filter_map(|uc| {
+                    uc.columns
+                        .iter()
+                        .map(|c| columns.iter().position(|col| &col.name == c))
+                        .collect::<Option<Vec<usize>>>()
+                })
+                .collect();
+            let mut seen: Vec<Vec<Vec<PgValue>>> = vec![Vec::new(); key_sets.len()];
+
+            for (row_idx, row) in rows.iter_mut().enumerate() {
+                let mut chosen = None;
+                let mut pool_was_empty = false;
+                for attempt in 0..=MAX_UNIQUE_RETRY_ATTEMPTS {
+                    let row_identity = if attempt == 0 {
+                        row_idx.to_string()
+                    } else {
+                        format!("{row_idx}#retry{attempt}")
+                    };
+                    let mut rng = derive_rng(
+                        &config.seed,
+                        &SeedKey {
+                            table: &table_name,
+                            column: &fk.name,
+                            row_identity: &row_identity,
+                        },
+                    );
+                    let Some(candidate) = ref_pool.sample(&fk.ref_table, &fk.ref_columns, &mut rng)
+                    else {
+                        pool_was_empty = true;
+                        break; // pool empty (e.g. 0 rows configured upstream) — leave NULL
+                    };
+                    let candidate_tuples: Vec<Vec<PgValue>> = key_sets
+                        .iter()
+                        .map(|key| {
+                            key.iter()
+                                .map(|&i| {
+                                    match fk.columns.iter().position(|c| {
+                                        columns.get(i).map(|col| &col.name == c).unwrap_or(false)
+                                    }) {
+                                        Some(pos) => candidate[pos].clone(),
+                                        None => row[i].clone(),
+                                    }
+                                })
+                                .collect()
+                        })
+                        .collect();
+                    let collides = candidate_tuples
+                        .iter()
+                        .zip(seen.iter())
+                        .any(|(t, s)| !t.iter().any(PgValue::is_null) && s.contains(t));
+                    if !collides {
+                        for (t, s) in candidate_tuples.into_iter().zip(seen.iter_mut()) {
+                            if !t.iter().any(PgValue::is_null) {
+                                s.push(t);
+                            }
                         }
+                        chosen = Some(candidate);
+                        break;
+                    }
+                }
+                match chosen {
+                    Some(tuple) => {
+                        for (col_name, val) in fk.columns.iter().zip(tuple) {
+                            if let Some(pos) = columns.iter().position(|c| &c.name == col_name) {
+                                row[pos] = val;
+                            }
+                        }
+                    }
+                    None if pool_was_empty => {} // leave NULL, as before
+                    None => {
+                        return Err(FeintError::Config(format!(
+                            "table `{}` couldn't resolve cyclic foreign key `{}` for row {} without \
+                             violating one of its own UNIQUE constraints after {MAX_UNIQUE_RETRY_ATTEMPTS} \
+                             attempts — the referenced table(s) likely don't have enough distinct rows to \
+                             fill it uniquely (increase their `rows:` in feint.yaml)",
+                            table_id.qualified(),
+                            fk.name,
+                            row_idx + 1,
+                        )));
                     }
                 }
             }
