@@ -700,7 +700,6 @@ This detection is based on column name patterns only. It does not know what the 
 - `feint snapshot` does not support a `strategy: generate` table (see [Hybrid clone](#hybrid-clone-mask--generate-in-one-run)); it rejects the config rather than only capturing part of a hybrid run.
 - A snapshot file is feint's own versioned format, meant only for a later `feint restore` by a compatible feint build. It is not a portable interchange format, and a file from a newer feint version than the one running `restore` is rejected rather than misread.
 - TLS support covers `sslmode=require`/`prefer` (encrypted, certificate not verified) and `disable` (plain). `verify-ca`/`verify-full` (full certificate chain and hostname verification) are not implemented yet and are rejected with a clear error rather than silently downgraded.
-- **A table where every column is server-assigned** (a serial/identity primary key and literally nothing else) silently generates zero rows through `up` or `clone`, while still reporting the row count as if they were written. Found while testing [Profile-driven generation](#profile-driven-generation); genuinely rare in practice (most tables have at least one other column) but real, and not fixed yet. A table like this needs a real column added to work around it for now.
 - Cardinality profiling (see [Profile-driven generation](#profile-driven-generation)) only covers single-column foreign keys, and `feint plan`'s row estimate doesn't read a profile.
 
 ## Development

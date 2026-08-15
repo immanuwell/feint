@@ -67,22 +67,31 @@ fn encode_copy_row(row: &[PgValue], out: &mut String) {
     out.push('\n');
 }
 
-/// Loads `rows` into `table` via `COPY ... FROM STDIN`. Never uses
+/// Loads `rows` into `table` via `COPY ... FROM STDIN`. A zero-column row
+/// (every column is server-assigned) cannot be represented by COPY, so that
+/// rare case falls back to `INSERT ... DEFAULT VALUES`. Never uses
 /// `RETURNING` or `OVERRIDING SYSTEM VALUE` — callers that need either
-/// (GENERATE mode on a table something else references; CLONE/restore on
-/// a table with a `GENERATED ALWAYS AS IDENTITY` column) must use
-/// `insert::execute_batched_insert` instead. `columns` must already
-/// exclude any column that shouldn't be written (stored-generated,
-/// server-assigned where the caller wants Postgres to assign it), same
-/// contract as `execute_batched_insert`.
+/// (GENERATE mode on a table something else references; CLONE/restore on a
+/// table with a `GENERATED ALWAYS AS IDENTITY` column) must use
+/// `insert::execute_batched_insert` instead. `columns` must already exclude
+/// any column that shouldn't be written (stored-generated, server-assigned
+/// where the caller wants Postgres to assign it), same contract as
+/// `execute_batched_insert`.
 pub(crate) async fn copy_rows(
     txn: &Transaction<'_>,
     table: &Table,
     columns: &[&Column],
     rows: &[Vec<PgValue>],
 ) -> Result<u64> {
-    if rows.is_empty() || columns.is_empty() {
+    if rows.is_empty() {
         return Ok(0);
+    }
+    if columns.is_empty() {
+        // COPY cannot express a row made entirely of defaults. Fall back
+        // to `INSERT ... DEFAULT VALUES` so an unreferenced table whose
+        // every column is server-assigned still receives its planned rows.
+        crate::insert::execute_batched_insert(txn, table, columns, rows, &[], false).await?;
+        return Ok(rows.len() as u64);
     }
 
     let col_list = columns

@@ -153,6 +153,60 @@ async fn tsvector_columns_receive_valid_nonempty_vectors() {
 }
 
 #[tokio::test]
+async fn unreferenced_server_assigned_only_table_inserts_every_planned_row() {
+    let mut db = TestDb::setup(
+        "unreferenced_server_assigned_only",
+        "CREATE TABLE standalone_ids (id serial PRIMARY KEY);",
+    )
+    .await;
+    let schema = db.introspect().await;
+
+    let summary = db.generate(&schema, 20).await;
+    assert_eq!(summary.total_rows, 20);
+    let actual: i64 = db
+        .client
+        .query_one(
+            &format!("SELECT count(*) FROM \"{}\".standalone_ids", db.schema_name),
+            &[],
+        )
+        .await
+        .expect("count generated standalone ids")
+        .get(0);
+    assert_eq!(actual, 20, "reported rows were not actually inserted");
+}
+
+#[tokio::test]
+async fn referenced_server_assigned_only_table_populates_the_fk_pool() {
+    let mut db = TestDb::setup(
+        "referenced_server_assigned_only",
+        "CREATE TABLE parent_ids (id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY); \
+         CREATE TABLE children (\
+             id serial PRIMARY KEY, \
+             parent_id bigint NOT NULL REFERENCES parent_ids(id)\
+         );",
+    )
+    .await;
+    let schema = db.introspect().await;
+
+    let summary = db.generate(&schema, 20).await;
+    assert_eq!(summary.total_rows, 40);
+    db.assert_no_orphans(&schema).await;
+    let actual: i64 = db
+        .client
+        .query_one(
+            &format!("SELECT count(*) FROM \"{}\".parent_ids", db.schema_name),
+            &[],
+        )
+        .await
+        .expect("count generated parent ids")
+        .get(0);
+    assert_eq!(
+        actual, 20,
+        "server-assigned keys were not returned and pooled"
+    );
+}
+
+#[tokio::test]
 async fn check_constraints_are_introspected_and_annotated_in_yaml() {
     let db = TestDb::setup(
         "check_constraints",

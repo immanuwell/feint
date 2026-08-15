@@ -508,9 +508,31 @@ pub(crate) async fn execute_batched_insert(
     returning: &[String],
     overriding_system_value: bool,
 ) -> Result<Vec<Vec<PgValue>>> {
-    if rows.is_empty() || columns.is_empty() {
+    if rows.is_empty() {
         return Ok(Vec::new());
     }
+
+    if columns.is_empty() {
+        // PostgreSQL has no multi-row `DEFAULT VALUES` form. This case is
+        // rare (a table made entirely of serial/identity/stored-generated
+        // columns), so issue one statement per planned row. Unlike the old
+        // early return, this both creates the real rows and captures any
+        // server-assigned keys needed by downstream foreign keys.
+        let sql = build_default_insert_sql(table, returning, overriding_system_value);
+        let mut returned = Vec::with_capacity(rows.len());
+        for _ in rows {
+            let result_rows = txn.query(&sql, &[]).await?;
+            for row in result_rows {
+                let mut tuple = Vec::with_capacity(returning.len());
+                for i in 0..returning.len() {
+                    tuple.push(row.get::<_, PgValue>(i));
+                }
+                returned.push(tuple);
+            }
+        }
+        return Ok(returned);
+    }
+
     let batch_rows = (MAX_BIND_PARAMS / columns.len()).clamp(1, MAX_BATCH_ROWS);
     let mut returned = Vec::with_capacity(rows.len());
 
@@ -537,6 +559,34 @@ pub(crate) async fn execute_batched_insert(
     }
 
     Ok(returned)
+}
+
+fn build_default_insert_sql(
+    table: &Table,
+    returning: &[String],
+    overriding_system_value: bool,
+) -> String {
+    let returning_clause = if returning.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " RETURNING {}",
+            returning
+                .iter()
+                .map(|c| format!("\"{c}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let overriding_clause = if overriding_system_value {
+        " OVERRIDING SYSTEM VALUE"
+    } else {
+        ""
+    };
+    format!(
+        "INSERT INTO \"{}\".\"{}\"{overriding_clause} DEFAULT VALUES{returning_clause}",
+        table.id.schema, table.id.name
+    )
 }
 
 pub(crate) fn build_insert_sql(
