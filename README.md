@@ -14,8 +14,8 @@ Every run is deterministic. Same seed, same input, same output, every time. A ma
 
 ## Quick demo
 
-```
-$ feint init postgres://localhost/myapp
+```bash
+feint init postgres://localhost/myapp
 
 6 tables
 5 foreign keys
@@ -28,8 +28,10 @@ Sensitive fields detected:
   payments.card_last4  potential_identifier
 
 Generated feint.yaml
+```
 
-$ feint plan postgres://localhost/myapp
+```bash
+feint plan postgres://localhost/myapp
 
 users
 ├── memberships
@@ -45,8 +47,10 @@ Insertion order:
   5. public.memberships (100 rows)
 
 Estimated 500 rows total
+```
 
-$ feint up postgres://localhost/myapp
+```bash
+feint up postgres://localhost/myapp
 
 Generating...
 
@@ -54,8 +58,10 @@ Generating...
 All constraints valid
 All foreign keys valid
 0 production values used
+```
 
-$ feint clone postgres://prod-host/myapp postgres://localhost/myapp_dev --root "organizations WHERE id = 42"
+```bash
+feint clone postgres://prod-host/myapp postgres://localhost/myapp_dev --root "organizations WHERE id = 42"
 
 Subset: 219 rows across 6 tables
 
@@ -63,8 +69,10 @@ Subset: 219 rows across 6 tables
 All constraints valid
 All foreign keys valid
 Primary keys and foreign keys preserved from source
+```
 
-$ feint mask postgres://localhost/myapp_stage --yes
+```bash
+feint mask postgres://localhost/myapp_stage --yes
 
 Tables and columns to mask:
   public.users: email (fake), phone (fake), ssn (fake)
