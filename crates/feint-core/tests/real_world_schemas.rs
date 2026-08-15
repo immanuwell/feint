@@ -9,9 +9,9 @@
 //! shared container, since every dump hardcodes `public.<table>` — a
 //! database is the cheapest way to get an isolated `public` schema without
 //! rewriting a single line of any dump. One `ghcr.io/immich-app/postgres`
-//! image is used for all ten: it's a real Postgres 16 with `vector` and
-//! `vchord` available on top, which two of the ten fixtures need, and having
-//! those extra extensions present is harmless for the other eight.
+//! image is used for all twenty: it's a real Postgres 16 with `vector` and
+//! `vchord` available on top, which two of the original ten fixtures need,
+//! and having those extra extensions present is harmless for the rest.
 //!
 //! Deliberately scoped to generate/clone/mask (the three modes every real
 //! database would actually go through). classify/profile/snapshot/subset
@@ -88,6 +88,56 @@ const FIXTURES: &[Fixture] = &[
     Fixture {
         name: "documenso",
         sql: include_str!("fixtures/real_world_schemas/documenso.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "plausible",
+        sql: include_str!("fixtures/real_world_schemas/plausible.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "firefly_iii",
+        sql: include_str!("fixtures/real_world_schemas/firefly_iii.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "zulip",
+        sql: include_str!("fixtures/real_world_schemas/zulip.sql"),
+        schema: "zulip",
+    },
+    Fixture {
+        name: "keycloak",
+        sql: include_str!("fixtures/real_world_schemas/keycloak.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "wallabag",
+        sql: include_str!("fixtures/real_world_schemas/wallabag.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "directus",
+        sql: include_str!("fixtures/real_world_schemas/directus.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "baserow",
+        sql: include_str!("fixtures/real_world_schemas/baserow.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "calcom",
+        sql: include_str!("fixtures/real_world_schemas/calcom.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "metabase",
+        sql: include_str!("fixtures/real_world_schemas/metabase.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "outline",
+        sql: include_str!("fixtures/real_world_schemas/outline.sql"),
         schema: "public",
     },
 ];
