@@ -6,13 +6,15 @@ license.workspace = true
 description.workspace = true
 keywords.workspace = true
 categories.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [[bin]]
 name = "feint"
 path = "src/main.rs"
 
 [dependencies]
-feint-core = { path = "../feint-core" }
+feint-core = { path = "../feint-core", version = "0.2.0" }
 tokio = { workspace = true }
 tokio-postgres = { workspace = true }
 clap = { workspace = true }

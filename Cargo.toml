@@ -9,6 +9,8 @@ license = "MIT"
 description = "Deterministic, Postgres-native synthetic test data"
 keywords = ["postgres", "postgresql", "database", "seed", "testing"]
 categories = ["command-line-utilities", "database"]
+repository = "https://github.com/immanuwell/feint"
+homepage = "https://ewry.net/feint/"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

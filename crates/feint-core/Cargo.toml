@@ -6,6 +6,8 @@ license.workspace = true
 description.workspace = true
 keywords.workspace = true
 categories.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 tokio = { workspace = true }
