@@ -114,7 +114,7 @@ This demo proves correctness across schema shapes, not volume. For that, `up`, `
 Linux and macOS, prebuilt binary:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/immanuwell/feint/main/install.sh | sh
+curl -fsSL ewry.net/feint.sh | sh
 ```
 
 Installs to `~/.local/bin`. Set `FEINT_VERSION=X.Y.Z` to pin a version instead of the latest release.
