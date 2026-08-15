@@ -9,12 +9,74 @@
 //! it. Without this module, feint could not connect to that class of
 //! database at all, for any command.
 
-use native_tls::TlsConnector as NativeTlsConnector;
-use postgres_native_tls::MakeTlsConnector;
+use std::sync::Arc;
+
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use tokio_postgres::config::SslMode;
 use tokio_postgres::{Client, Config};
+use tokio_postgres_rustls::MakeRustlsConnect;
 
 use crate::error::{FeintError, Result};
+
+/// A `rustls` server certificate verifier that unconditionally accepts
+/// whatever certificate and hostname the server presents, while still
+/// performing genuine handshake signature verification (rustls's own
+/// official pattern for this — see `examples/src/bin/tlsclient-mio.rs` in
+/// the rustls repo). This is the rustls equivalent of native-tls's
+/// `danger_accept_invalid_certs(true)` + `danger_accept_invalid_hostnames(true)`:
+/// the connection is still encrypted and the server must still prove it
+/// holds the private key for whatever certificate it sent, but the
+/// certificate's trust chain and hostname are never checked.
+#[derive(Debug)]
+struct NoCertVerification(CryptoProvider);
+
+impl ServerCertVerifier for NoCertVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
 
 /// Connect to Postgres, honoring `sslmode` from `database_url`.
 ///
@@ -42,12 +104,14 @@ pub async fn connect(database_url: &str) -> Result<Client> {
             Ok(client)
         }
         SslMode::Prefer | SslMode::Require => {
-            let connector = NativeTlsConnector::builder()
-                .danger_accept_invalid_certs(true)
-                .danger_accept_invalid_hostnames(true)
-                .build()
-                .map_err(|e| FeintError::Config(format!("failed to build TLS connector: {e}")))?;
-            let connector = MakeTlsConnector::new(connector);
+            let provider = rustls::crypto::ring::default_provider();
+            let tls_config = ClientConfig::builder_with_provider(Arc::new(provider.clone()))
+                .with_safe_default_protocol_versions()
+                .map_err(|e| FeintError::Config(format!("failed to build TLS connector: {e}")))?
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoCertVerification(provider)))
+                .with_no_client_auth();
+            let connector = MakeRustlsConnect::new(tls_config);
             let (client, connection) = config.connect(connector).await?;
             spawn_connection(connection);
             Ok(client)
