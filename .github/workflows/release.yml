@@ -18,12 +18,23 @@ jobs:
             os: ubuntu-latest
           - target: x86_64-apple-darwin
             os: macos-13
+            allow-failure: true
           - target: aarch64-apple-darwin
             os: macos-14
+            allow-failure: true
           - target: x86_64-pc-windows-msvc
             os: windows-latest
 
     runs-on: ${{ matrix.os }}
+    # macOS runners have been queuing for hours instead of failing fast when
+    # a runner image is under capacity or being deprecated (this is what
+    # actually happened to the 0.1.0 release: x86_64-apple-darwin queued on
+    # macos-13 for 2.5 hours, then got cancelled, which cancelled the whole
+    # release). continue-on-error lets a stuck or failed macOS leg drop out
+    # without blocking `release`'s `needs: build`; the other platforms still
+    # ship even if one macOS target doesn't.
+    continue-on-error: ${{ matrix.allow-failure == true }}
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
