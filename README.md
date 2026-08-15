@@ -127,6 +127,12 @@ curl -fsSL ewry.net/feint.sh | sh
 
 Installs to `~/.local/bin`. Set `FEINT_VERSION=X.Y.Z` to pin a version instead of the latest release.
 
+macOS (Apple Silicon) or Linux, via Homebrew:
+
+```
+brew install immanuwell/tap/feint
+```
+
 Or build from source (needs Rust and Cargo, get them from [rustup.rs](https://rustup.rs)):
 
 ```
