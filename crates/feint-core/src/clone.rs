@@ -269,7 +269,13 @@ pub(crate) async fn resync_sequences(
         let Some(max_value) = rows.iter().filter_map(|r| pgvalue_as_i64(&r[idx])).max() else {
             continue;
         };
-        let qualified = format!("{}.{}", table.id.schema, table.id.name);
+        // `pg_get_serial_sequence`'s `table_name` argument is parsed with
+        // ordinary SQL identifier rules, not treated as a literal relation
+        // name: an unquoted mixed-case part (e.g. Documenso's `"User"`
+        // table) silently case-folds to `user` and the lookup misses.
+        // Quoting each part here preserves the case exactly like it would
+        // in a normal qualified reference.
+        let qualified = format!("\"{}\".\"{}\"", table.id.schema, table.id.name);
         let seq_row = target_txn
             .query_one(
                 "SELECT pg_get_serial_sequence($1, $2)",
