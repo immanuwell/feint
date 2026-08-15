@@ -25,6 +25,27 @@ impl Drop for ContainerGuard {
     }
 }
 
+/// `pg_isready` (checked via `docker exec`, inside the container's own
+/// network namespace) can succeed slightly before the externally
+/// published port is stable, causing an intermittent "connection reset
+/// by peer" on the very next real connection attempt. Retrying the
+/// actual connection a few times, rather than trusting `pg_isready` as a
+/// sufficient proxy for external reachability, is what actually fixes
+/// that instead of just trusting a longer `pg_isready` poll.
+async fn connect_with_retry(url: &str) -> feint_core::Result<tokio_postgres::Client> {
+    let mut last_err = None;
+    for _ in 0..10 {
+        match feint_core::connect::connect(url).await {
+            Ok(client) => return Ok(client),
+            Err(e) => {
+                last_err = Some(e);
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+        }
+    }
+    Err(last_err.unwrap())
+}
+
 fn run(cmd: &mut Command) -> String {
     let output = cmd.output().expect("spawn command");
     assert!(
@@ -77,7 +98,7 @@ async fn sslmode_require_connects_over_a_real_tls_handshake() {
     let _guard = ContainerGuard(container_id.clone());
 
     // Wait for the initial (plain) startup to accept connections.
-    for _ in 0..30 {
+    for _ in 0..60 {
         let ready = Command::new("docker")
             .args(["exec", &container_id, "pg_isready", "-U", "postgres"])
             .output()
@@ -173,7 +194,7 @@ async fn sslmode_require_connects_over_a_real_tls_handshake() {
 
     // Wait for the post-restart (now SSL-enabled) server to come back up.
     let mut ssl_confirmed = false;
-    for _ in 0..30 {
+    for _ in 0..60 {
         let ready = Command::new("docker")
             .args(["exec", &container_id, "pg_isready", "-U", "postgres"])
             .output()
@@ -206,7 +227,7 @@ async fn sslmode_require_connects_over_a_real_tls_handshake() {
     // server that only has a self-signed cert (mirroring the "encrypted,
     // certificate not validated" contract documented in DOCS.md).
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres?sslmode=require");
-    let client = feint_core::connect::connect(&url)
+    let client = connect_with_retry(&url)
         .await
         .expect("connect over sslmode=require must succeed against a self-signed cert");
     let row = client
@@ -235,7 +256,7 @@ async fn sslmode_disable_still_connects_without_tls() {
     ]));
     let _guard = ContainerGuard(container_id.clone());
 
-    for _ in 0..30 {
+    for _ in 0..60 {
         let ready = Command::new("docker")
             .args(["exec", &container_id, "pg_isready", "-U", "postgres"])
             .output()
@@ -255,7 +276,7 @@ async fn sslmode_disable_still_connects_without_tls() {
     ]));
 
     let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres?sslmode=disable");
-    let client = feint_core::connect::connect(&url)
+    let client = connect_with_retry(&url)
         .await
         .expect("sslmode=disable must still connect plainly");
     let row = client.query_one("SELECT 1", &[]).await.expect("query");

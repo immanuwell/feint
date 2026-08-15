@@ -43,7 +43,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release -p feint-cli --target ${{ matrix.target }}
+        run: cargo build --release -p feint --target ${{ matrix.target }}
 
       - name: Package (unix)
         if: runner.os != 'Windows'
