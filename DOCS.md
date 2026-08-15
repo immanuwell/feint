@@ -568,7 +568,7 @@ tables:
         generator: bool
 ```
 
-Built in generator names: `email`, `phone`, `first_name`, `last_name`, `person_name`, `bool`, `int2_range`, `int4_range`, `int8_range`, `decimal`, `float4`, `float8`, `uuid`, `timestamp`, `timestamptz`, `date`, `json_object`, `bytea`, `inet`, `lorem_word`.
+Built in generator names: `email`, `phone`, `first_name`, `last_name`, `person_name`, `bool`, `int2_range`, `int4_range`, `int8_range`, `decimal`, `float4`, `float8`, `uuid`, `timestamp`, `timestamptz`, `date`, `json_object`, `bytea`, `inet`, `tsvector`, `lorem_word`.
 
 ### CHECK constraint comments
 
@@ -666,6 +666,7 @@ Scope, on purpose:
 | Domains | Yes, generates a value for the underlying base type |
 | Arrays | Yes, generates a short array of the element type. Reading an array back out of Postgres (`clone`, `mask`) round-trips correctly in both text and binary wire format |
 | JSONB and JSON | Yes, generates a small JSON object |
+| tsvector | `up` generates a short vector of positioned lexemes. Reading one back in `clone` or `mask` is not supported yet |
 | UUID primary keys | Yes, generated client side so `--seed` stays reproducible even when the column has a `DEFAULT gen_random_uuid()` |
 | Serial and identity columns | Yes. `up` leaves them for Postgres to assign, then reads the result back. `clone` preserves the source's real value instead, and resyncs the target's sequence afterward so the next unrelated insert does not collide |
 | Partitioned tables | Yes, feint inserts into the parent table and lets Postgres route rows to partitions |
@@ -685,6 +686,7 @@ This detection is based on column name patterns only. It does not know what the 
 
 - CHECK constraints are not validated before insert. feint relies on the transaction rolling back cleanly if one fails.
 - Composite types (custom `CREATE TYPE ... AS (...)` structs) have no generator yet.
+- `tsvector` generation works, but reading a `tsvector` back from Postgres in `clone` or `mask` does not decode its binary wire format yet.
 - citext, inet, and cidr columns use a generic fallback rather than a purpose built generator. Reading one of these back out of Postgres (via `clone` or `mask`) round-trips correctly when the driver requests text format, but not when it requests binary, a real, currently unfixed gap. (An *array* of any type, including these, round-trips correctly in both formats regardless: its own binary envelope is decoded properly, and each element then goes through this same per-element logic, so only the scalar case above is affected.)
 - The column name heuristic does not know what a table represents, only the column name.
 - The whole run is still one transaction, that part is unchanged, and still not built around constant memory for an unbounded row count (rows are fully materialized before any write). What changed: bulk loading uses `COPY` instead of chunked, parameterized `INSERT` wherever nothing needs `RETURNING` or `OVERRIDING SYSTEM VALUE` (`clone`, `restore`, and any `up`/generate-strategy table nothing else references), removing the old few-hundred-rows-per-statement ceiling entirely for that path. A table `up` needs `RETURNING` for (because something else references it), and a `clone`/`restore` table with a `GENERATED ALWAYS AS IDENTITY` column, still use the older chunked-`INSERT` path, unchanged.

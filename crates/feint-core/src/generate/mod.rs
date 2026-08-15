@@ -299,6 +299,7 @@ fn scalar_type_generator(type_name: &str) -> &'static str {
         "json" | "jsonb" => "json_object",
         "bytea" => "bytea",
         "inet" | "cidr" => "inet",
+        "tsvector" => "tsvector",
         _ => "lorem_word",
     }
 }
@@ -354,6 +355,30 @@ fn dispatch_named(name: &str, column: &Column, rng: &mut ChaCha8Rng) -> Result<P
                 "{}.{}.{}.{}",
                 octets[0], octets[1], octets[2], octets[3]
             ))
+        }
+        "tsvector" => {
+            let len = rng.gen_range(1..=4usize);
+            let lexemes = (1..=len)
+                .map(|position| {
+                    let word = Word().fake_with_rng::<String, _>(rng);
+                    let safe_word: String = word
+                        .chars()
+                        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                        .collect();
+                    let safe_word = if safe_word.is_empty() {
+                        "term".to_string()
+                    } else {
+                        safe_word.to_ascii_lowercase()
+                    };
+                    format!("'{safe_word}':{position}")
+                })
+                .collect::<Vec<_>>();
+            // `tsvector` has a structured binary wire format. Sending a
+            // `PgValue::Text` makes Postgres interpret UTF-8 prose as that
+            // binary structure and reject it with "invalid size of
+            // tsvector". `Raw` selects text format, where this canonical
+            // lexeme-and-position syntax is parsed correctly.
+            PgValue::Raw(lexemes.join(" "))
         }
         other => {
             return Err(FeintError::Generation(format!(
@@ -457,6 +482,30 @@ mod tests {
                 assert!(["sad", "ok", "happy"].contains(&label.as_str()));
             }
             other => panic!("expected Enum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tsvector_generator_uses_a_text_format_literal() {
+        let col = Column {
+            type_name: "tsvector".to_string(),
+            ..text_column("document_vectors")
+        };
+        let mut rng = derive_rng(
+            "seed",
+            &SeedKey {
+                table: "entries",
+                column: "document_vectors",
+                row_identity: "0",
+            },
+        );
+        let value = generate_value(&col, None, &mut rng).unwrap();
+        match value {
+            PgValue::Raw(vector) => {
+                assert!(!vector.is_empty());
+                assert!(vector.contains(":"), "expected positioned lexemes");
+            }
+            other => panic!("expected Raw, got {other:?}"),
         }
     }
 

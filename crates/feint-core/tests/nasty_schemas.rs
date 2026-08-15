@@ -120,6 +120,39 @@ async fn enum_array_elements_are_introspected_and_generated_as_enum_values() {
 }
 
 #[tokio::test]
+async fn tsvector_columns_receive_valid_nonempty_vectors() {
+    let mut db = TestDb::setup(
+        "tsvector_generation",
+        "CREATE TABLE searchable_documents (\
+             id serial PRIMARY KEY, \
+             document_vectors tsvector NOT NULL\
+         ); \
+         CREATE TABLE document_comments (\
+             id serial PRIMARY KEY, \
+             document_id integer NOT NULL REFERENCES searchable_documents(id)\
+         );",
+    )
+    .await;
+    let schema = db.introspect().await;
+
+    db.generate(&schema, 20).await;
+    let empty_vectors: i64 = db
+        .client
+        .query_one(
+            &format!(
+                "SELECT count(*) FROM \"{}\".searchable_documents \
+                 WHERE length(document_vectors::text) = 0",
+                db.schema_name
+            ),
+            &[],
+        )
+        .await
+        .expect("query generated tsvectors")
+        .get(0);
+    assert_eq!(empty_vectors, 0, "generated an empty tsvector");
+}
+
+#[tokio::test]
 async fn check_constraints_are_introspected_and_annotated_in_yaml() {
     let db = TestDb::setup(
         "check_constraints",
