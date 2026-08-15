@@ -237,11 +237,14 @@ fn dispatch_by_type(
             // the common case.
             dispatch_by_type(base_type, &TypeKind::Scalar, nullable, rng)
         }
-        TypeKind::Array { elem_type } => {
+        TypeKind::Array {
+            elem_type,
+            elem_kind,
+        } => {
             let len = rng.gen_range(1..=3usize);
             let mut items = Vec::with_capacity(len);
             for _ in 0..len {
-                items.push(dispatch_by_type(elem_type, &TypeKind::Scalar, false, rng)?);
+                items.push(dispatch_by_type(elem_type, elem_kind, false, rng)?);
             }
             Ok(PgValue::Array(items))
         }

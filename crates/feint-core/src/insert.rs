@@ -495,7 +495,7 @@ fn generate_unique_row(
 
 pub(crate) fn sql_cast_type(column: &Column) -> String {
     match &column.type_kind {
-        crate::introspect::TypeKind::Array { elem_type } => format!("\"{elem_type}\"[]"),
+        crate::introspect::TypeKind::Array { elem_type, .. } => format!("\"{elem_type}\"[]"),
         _ => format!("\"{}\"", column.type_name),
     }
 }

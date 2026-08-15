@@ -45,8 +45,13 @@ pub enum Identity {
 pub enum TypeKind {
     Scalar,
     Enum(Vec<String>),
-    Domain { base_type: String },
-    Array { elem_type: String },
+    Domain {
+        base_type: String,
+    },
+    Array {
+        elem_type: String,
+        elem_kind: Box<TypeKind>,
+    },
     Composite,
     Other,
 }
@@ -219,7 +224,10 @@ async fn list_columns(
         .query(
             "SELECT a.attnum, a.attname, a.attnotnull, a.attidentity, a.attgenerated, \
                     t.oid, t.typname, t.typtype, t.typcategory, t.typbasetype, \
-                    bt.typname AS base_typname, et.typname AS elem_typname, \
+                    bt.typname AS base_typname, \
+                    et.oid AS elem_type_oid, et.typname AS elem_typname, \
+                    et.typtype AS elem_typtype, et.typbasetype AS elem_base_type_oid, \
+                    ebt.typname AS elem_base_typname, \
                     (SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d \
                        WHERE d.adrelid = a.attrelid AND d.adnum = a.attnum) AS default_expr, \
                     a.atttypmod \
@@ -227,6 +235,7 @@ async fn list_columns(
              JOIN pg_type t ON t.oid = a.atttypid \
              LEFT JOIN pg_type bt ON bt.oid = t.typbasetype \
              LEFT JOIN pg_type et ON et.oid = t.typelem AND t.typcategory = 'A' \
+             LEFT JOIN pg_type ebt ON ebt.oid = et.typbasetype \
              WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped \
              ORDER BY a.attnum",
             &[&table_oid],
@@ -246,9 +255,13 @@ async fn list_columns(
         let type_category: i8 = row.get(8);
         let base_type_oid: u32 = row.get(9);
         let base_typname: Option<String> = row.get(10);
-        let elem_typname: Option<String> = row.get(11);
-        let default_expr: Option<String> = row.get(12);
-        let typmod: i32 = row.get(13);
+        let elem_type_oid: Option<u32> = row.get(11);
+        let elem_typname: Option<String> = row.get(12);
+        let elem_typtype: Option<i8> = row.get(13);
+        let elem_base_type_oid: Option<u32> = row.get(14);
+        let elem_base_typname: Option<String> = row.get(15);
+        let default_expr: Option<String> = row.get(16);
+        let typmod: i32 = row.get(17);
         // `atttypmod` for varchar(N)/bpchar(N) is N + 4 (VARHDRSZ); -1
         // means unbounded (plain `text`/`citext`, or `varchar` with no
         // length given).
@@ -283,9 +296,34 @@ async fn list_columns(
                 base_type: base_typname.unwrap_or_else(|| format!("oid:{base_type_oid}")),
             },
             'c' => TypeKind::Composite,
-            _ if type_category as u8 as char == 'A' => TypeKind::Array {
-                elem_type: elem_typname.unwrap_or_else(|| "unknown".to_string()),
-            },
+            _ if type_category as u8 as char == 'A' => {
+                let elem_type = elem_typname.unwrap_or_else(|| "unknown".to_string());
+                let elem_kind = match elem_typtype.map(|v| v as u8 as char) {
+                    Some('e') => {
+                        let oid = elem_type_oid.unwrap_or_default();
+                        let variants = if let Some(variants) = enum_cache.get(&oid) {
+                            variants.clone()
+                        } else {
+                            let variants = list_enum_variants(client, oid).await?;
+                            enum_cache.insert(oid, variants.clone());
+                            variants
+                        };
+                        TypeKind::Enum(variants)
+                    }
+                    Some('d') => TypeKind::Domain {
+                        base_type: elem_base_typname.unwrap_or_else(|| {
+                            format!("oid:{}", elem_base_type_oid.unwrap_or_default())
+                        }),
+                    },
+                    Some('c') => TypeKind::Composite,
+                    Some('b') => TypeKind::Scalar,
+                    _ => TypeKind::Other,
+                };
+                TypeKind::Array {
+                    elem_type,
+                    elem_kind: Box::new(elem_kind),
+                }
+            }
             'b' => TypeKind::Scalar,
             _ => TypeKind::Other,
         };

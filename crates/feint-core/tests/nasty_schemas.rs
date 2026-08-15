@@ -3,6 +3,7 @@ mod common;
 use common::TestDb;
 use feint_core::config::FeintConfig;
 use feint_core::graph::plan_insertion;
+use feint_core::introspect::TypeKind;
 use rstest::rstest;
 
 #[rstest]
@@ -72,6 +73,50 @@ async fn hard_unsatisfiable_cycle_is_rejected_at_planning_time() {
         result.is_err(),
         "expected a NOT NULL, non-deferrable FK cycle to be rejected before any insert is attempted"
     );
+}
+
+#[tokio::test]
+async fn enum_array_elements_are_introspected_and_generated_as_enum_values() {
+    let mut db = TestDb::setup(
+        "enum_array_elements",
+        include_str!("fixtures/schemas/enums.sql"),
+    )
+    .await;
+    let schema = db.introspect().await;
+    let people = schema
+        .tables
+        .iter()
+        .find(|table| table.id.name == "people")
+        .expect("people table");
+    let recent_moods = people.column("recent_moods").expect("recent_moods column");
+    assert_eq!(
+        recent_moods.type_kind,
+        TypeKind::Array {
+            elem_type: "mood".to_string(),
+            elem_kind: Box::new(TypeKind::Enum(vec![
+                "sad".to_string(),
+                "ok".to_string(),
+                "happy".to_string(),
+            ])),
+        }
+    );
+
+    db.generate(&schema, 20).await;
+    let invalid: i64 = db
+        .client
+        .query_one(
+            &format!(
+                "SELECT count(*) FROM \"{}\".people p \
+                 WHERE EXISTS (SELECT 1 FROM unnest(p.recent_moods) mood \
+                               WHERE mood NOT IN ('sad', 'ok', 'happy'))",
+                db.schema_name
+            ),
+            &[],
+        )
+        .await
+        .expect("query generated enum arrays")
+        .get(0);
+    assert_eq!(invalid, 0, "generated an undeclared enum-array element");
 }
 
 #[tokio::test]
