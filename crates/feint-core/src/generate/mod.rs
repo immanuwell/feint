@@ -281,6 +281,10 @@ fn placeholder_column(type_name: &str, nullable: bool) -> Column {
         type_kind: TypeKind::Scalar,
         max_length: None,
         vector_dimensions: None,
+        numeric_precision: None,
+        numeric_scale: None,
+        check_min: None,
+        check_max: None,
         nullable,
         identity: crate::introspect::Identity::None,
         is_stored_generated: false,
@@ -304,6 +308,9 @@ fn scalar_type_generator(type_name: &str) -> &str {
         "date" => "date",
         "json" | "jsonb" => "json_object",
         "bytea" => "bytea",
+        "oid" => "oid",
+        "interval" => "interval",
+        "time" | "timetz" => "time",
         "inet" | "cidr" => "inet",
         "tsvector" => "tsvector",
         "point" | "line" | "lseg" | "box" | "path" | "polygon" | "circle" => type_name,
@@ -328,13 +335,44 @@ fn dispatch_named(name: &str, column: &Column, rng: &mut ChaCha8Rng) -> Result<P
             }
         }
         "bool" => PgValue::Bool(rng.gen_bool(0.5)),
-        "int2_range" => PgValue::Int2(rng.gen_range(-1000..1000)),
-        "int4_range" => PgValue::Int4(rng.gen_range(0..1_000_000)),
-        "int8_range" => PgValue::Int8(rng.gen_range(0..1_000_000_000i64)),
-        "decimal" => {
-            let cents = rng.gen_range(0..10_000_000i64);
-            PgValue::Numeric(Decimal::new(cents, 2))
+        "int2_range" => {
+            let (lo, hi) = bounded_range(
+                -1000,
+                999,
+                column.check_min,
+                column.check_max,
+                i16::MIN as i64,
+                i16::MAX as i64,
+            );
+            PgValue::Int2(rng.gen_range(lo..=hi) as i16)
         }
+        "int4_range" => {
+            let (lo, hi) = bounded_range(
+                0,
+                999_999,
+                column.check_min,
+                column.check_max,
+                i32::MIN as i64,
+                i32::MAX as i64,
+            );
+            PgValue::Int4(rng.gen_range(lo..=hi) as i32)
+        }
+        "int8_range" => {
+            let (lo, hi) = bounded_range(
+                0,
+                999_999_999,
+                column.check_min,
+                column.check_max,
+                i64::MIN,
+                i64::MAX,
+            );
+            PgValue::Int8(rng.gen_range(lo..=hi))
+        }
+        "decimal" => PgValue::Numeric(random_numeric(
+            rng,
+            column.numeric_precision,
+            column.numeric_scale,
+        )),
         "float4" => PgValue::Float4(rng.gen_range(0.0..1_000.0)),
         "float8" => PgValue::Float8(rng.gen_range(0.0..1_000.0)),
         "uuid" => {
@@ -364,6 +402,26 @@ fn dispatch_named(name: &str, column: &Column, rng: &mut ChaCha8Rng) -> Result<P
                 octets[0], octets[1], octets[2], octets[3]
             ))
         }
+        // `oid` is Postgres's raw 4-byte unsigned object identifier type
+        // (used standalone, e.g. Keycloak's `event_data oid`, not just as
+        // the hidden system column). Its text input function accepts any
+        // value in `u32` range.
+        "oid" => PgValue::Raw(rng.gen::<u32>().to_string()),
+        // `interval`'s canonical text input accepts a plain `N seconds`
+        // literal for any `N` (including negative/fractional), which is
+        // enough to exercise a duration column like Baserow's
+        // `dependency_buffer interval` without needing the full
+        // `HH:MM:SS`/`P...T...` ISO 8601 grammar.
+        "interval" => PgValue::Raw(format!("{} seconds", rng.gen_range(-604_800..604_800i64))),
+        // `time`/`timetz` (`time without/with time zone`): a plain
+        // `HH:MM:SS` literal parses under either, since `timetz`'s input
+        // function defaults a missing offset to the session's own.
+        "time" => PgValue::Raw(format!(
+            "{:02}:{:02}:{:02}",
+            rng.gen_range(0..24u32),
+            rng.gen_range(0..60u32),
+            rng.gen_range(0..60u32)
+        )),
         "tsvector" => {
             let len = rng.gen_range(1..=4usize);
             let lexemes = (1..=len)
@@ -443,6 +501,67 @@ fn dispatch_named(name: &str, column: &Column, rng: &mut ChaCha8Rng) -> Result<P
     })
 }
 
+/// Combine a generator's default `[default_lo, default_hi]` span with a
+/// column's `CHECK`-derived `[check_min, check_max]` (either side may be
+/// absent), clamped to the target integer type's own range. A one-sided
+/// CHECK bound (e.g. `col >= 5000` with no upper bound) widens outward from
+/// that bound using the generator's usual span rather than collapsing to a
+/// single value.
+fn bounded_range(
+    default_lo: i64,
+    default_hi: i64,
+    check_min: Option<i64>,
+    check_max: Option<i64>,
+    type_lo: i64,
+    type_hi: i64,
+) -> (i64, i64) {
+    let span = (default_hi - default_lo).max(0);
+    let lo = check_min.unwrap_or(default_lo).clamp(type_lo, type_hi);
+    let hi = check_max
+        .unwrap_or_else(|| lo.saturating_add(span))
+        .clamp(type_lo, type_hi);
+    if lo <= hi {
+        (lo, hi)
+    } else {
+        (hi, hi)
+    }
+}
+
+/// Generate a value that fits `numeric(precision, scale)`'s declared
+/// digit budget. Without this, a fixed scale-2 value like feint used to
+/// generate would overflow any narrower column — e.g. Firefly III's
+/// `numeric(12,8)` latitude/longitude columns, which allow only 4 digits
+/// before the decimal point. Falls back to the old scale-2 behavior for a
+/// bare `numeric` with no declared modifier.
+fn random_numeric(rng: &mut ChaCha8Rng, precision: Option<i32>, scale: Option<i32>) -> Decimal {
+    if let (Some(precision), Some(scale)) = (precision, scale) {
+        if precision > 0 && scale >= 0 && precision >= scale {
+            // Cap the digits actually used so the mantissa always fits an
+            // `i64` (`Decimal::new` takes one): real-world numeric(p,s)
+            // columns (money, coordinates, exchange rates, ...) don't need
+            // more than this to exercise generation correctly.
+            let scale = (scale as u32).min(12);
+            let integer_digits =
+                ((precision - scale as i32).max(0) as u32).min(18u32.saturating_sub(scale));
+            let max_integer = 10i64.pow(integer_digits) - 1;
+            let integer_part = if max_integer > 0 {
+                rng.gen_range(0..=max_integer)
+            } else {
+                0
+            };
+            let scale_pow = 10i64.pow(scale);
+            let frac_part = if scale_pow > 1 {
+                rng.gen_range(0..scale_pow)
+            } else {
+                0
+            };
+            return Decimal::new(integer_part * scale_pow + frac_part, scale);
+        }
+    }
+    let cents = rng.gen_range(0..10_000_000i64);
+    Decimal::new(cents, 2)
+}
+
 fn random_point_literal(rng: &mut ChaCha8Rng) -> String {
     let x = rng.gen_range(-180.0..180.0f64);
     let y = rng.gen_range(-90.0..90.0f64);
@@ -470,6 +589,10 @@ mod tests {
             type_kind: TypeKind::Scalar,
             max_length: None,
             vector_dimensions: None,
+            numeric_precision: None,
+            numeric_scale: None,
+            check_min: None,
+            check_max: None,
             nullable: false,
             identity: Identity::None,
             is_stored_generated: false,

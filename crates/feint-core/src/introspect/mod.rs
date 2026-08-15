@@ -69,6 +69,19 @@ pub struct Column {
     /// Declared dimension for pgvector's `vector(N)` type. `None` for an
     /// unconstrained vector and every non-vector type.
     pub vector_dimensions: Option<i32>,
+    /// Declared `numeric(precision, scale)`. Both `None` for a bare
+    /// `numeric` with no modifier (unbounded) and every non-numeric type.
+    /// Generators use this to stay within the column's total-digit budget
+    /// instead of overflowing it.
+    pub numeric_precision: Option<i32>,
+    pub numeric_scale: Option<i32>,
+    /// Lower/upper bound narrowed from a simple single-column CHECK
+    /// constraint on an `int2`/`int4`/`int8` column (e.g. `CHECK (col >=
+    /// 0)`, the standard shape Django's `PositiveSmallIntegerField` and
+    /// friends emit). `None` when no such constraint exists, or when the
+    /// table has one but it's not this narrow, safely-parseable shape.
+    pub check_min: Option<i64>,
+    pub check_max: Option<i64>,
     pub nullable: bool,
     pub identity: Identity,
     /// `GENERATED ALWAYS AS (...) STORED` — never written by feint.
@@ -209,7 +222,7 @@ pub async fn introspect(client: &Client, schemas: &[String]) -> Result<Schema> {
 
     let mut tables = Vec::with_capacity(raw_tables.len());
     for rt in &raw_tables {
-        let columns = list_columns(client, rt.oid, &mut enum_cache).await?;
+        let mut columns = list_columns(client, rt.oid, &mut enum_cache).await?;
         let unique_constraints = list_unique_constraints(client, rt.oid).await?;
         let primary_key = unique_constraints
             .iter()
@@ -217,6 +230,14 @@ pub async fn introspect(client: &Client, schemas: &[String]) -> Result<Schema> {
             .map(|u| u.columns.clone());
         let foreign_keys = list_foreign_keys(client, rt.oid).await?;
         let check_constraints = list_check_constraints(client, rt.oid).await?;
+
+        for col in &mut columns {
+            if matches!(col.type_name.as_str(), "int2" | "int4" | "int8") {
+                let (min, max) = simple_integer_bounds(&check_constraints, &col.name);
+                col.check_min = min;
+                col.check_max = max;
+            }
+        }
 
         tables.push(Table {
             id: rt.id.clone(),
@@ -326,6 +347,15 @@ async fn list_columns(
         } else {
             None
         };
+        // `numeric(precision, scale)` packs both into `atttypmod` as
+        // `((precision << 16) | scale) + VARHDRSZ` (VARHDRSZ == 4); -1
+        // means a bare `numeric` with no modifier (unbounded).
+        let (numeric_precision, numeric_scale) = if typmod > 0 && type_name == "numeric" {
+            let packed = typmod - 4;
+            (Some(packed >> 16), Some(packed & 0xffff))
+        } else {
+            (None, None)
+        };
 
         let identity = match identity_char as u8 as char {
             'a' => Identity::Always,
@@ -391,6 +421,12 @@ async fn list_columns(
             type_kind,
             max_length,
             vector_dimensions,
+            numeric_precision,
+            numeric_scale,
+            // Filled in by `introspect()` once this table's check
+            // constraints are known — `list_columns` runs before that.
+            check_min: None,
+            check_max: None,
             nullable: !not_null,
             identity,
             is_stored_generated,
@@ -519,6 +555,62 @@ async fn list_foreign_keys(client: &Client, table_oid: u32) -> Result<Vec<Foreig
             initially_deferred: row.get(6),
         })
         .collect())
+}
+
+/// Matches `pg_get_constraintdef`'s output for exactly one shape: a single
+/// unqualified (optionally double-quoted) column compared to an integer
+/// literal — `CHECK ((col >= 0))`, `CHECK ((col <= 100))`, etc. This is the
+/// standard shape Django's `PositiveSmallIntegerField`/`PositiveIntegerField`
+/// and Rails' numeric validators emit, and it showed up dozens of times
+/// across the real-world schema pilot (Zulip especially). Anything more
+/// complex — cross-column, string, boolean, function-call expressions — is
+/// deliberately left unmatched: feint doesn't attempt to evaluate arbitrary
+/// CHECK expressions, only this narrow, common, safely-parseable one.
+static SIMPLE_INT_CHECK_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r#"^CHECK \(\(\s*"?([A-Za-z_][A-Za-z0-9_]*)"?\s*(>=|<=|>|<|=)\s*(-?\d+)\s*\)\)$"#,
+    )
+    .expect("valid regex")
+});
+
+/// Narrow the generated range for `column_name` using every simple,
+/// single-column integer CHECK constraint on `table` that mentions it
+/// (multiple constraints on the same column — e.g. a separate lower and
+/// upper bound — are intersected). Returns `(None, None)` when nothing
+/// matches, which generation treats as "no narrowing, use the type's usual
+/// default range."
+fn simple_integer_bounds(
+    check_constraints: &[CheckConstraint],
+    column_name: &str,
+) -> (Option<i64>, Option<i64>) {
+    let mut min: Option<i64> = None;
+    let mut max: Option<i64> = None;
+    for c in check_constraints {
+        let Some(caps) = SIMPLE_INT_CHECK_RE.captures(c.definition.trim()) else {
+            continue;
+        };
+        if &caps[1] != column_name {
+            continue;
+        }
+        let Ok(value) = caps[3].parse::<i64>() else {
+            continue;
+        };
+        let (lo, hi) = match &caps[2] {
+            ">=" => (Some(value), None),
+            ">" => (value.checked_add(1), None),
+            "<=" => (None, Some(value)),
+            "<" => (None, value.checked_sub(1)),
+            "=" => (Some(value), Some(value)),
+            _ => continue,
+        };
+        if let Some(lo) = lo {
+            min = Some(min.map_or(lo, |m| m.max(lo)));
+        }
+        if let Some(hi) = hi {
+            max = Some(max.map_or(hi, |m| m.min(hi)));
+        }
+    }
+    (min, max)
 }
 
 async fn list_check_constraints(client: &Client, table_oid: u32) -> Result<Vec<CheckConstraint>> {
