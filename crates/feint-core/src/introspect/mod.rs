@@ -82,6 +82,18 @@ pub struct Column {
     /// table has one but it's not this narrow, safely-parseable shape.
     pub check_min: Option<i64>,
     pub check_max: Option<i64>,
+    /// The fixed set of legal values narrowed from a simple single-column
+    /// CHECK constraint of the shape `CHECK (col = ANY (ARRAY['a', 'b']))`
+    /// (any cast variant Postgres's `pg_get_constraintdef` emits — plain,
+    /// `::text`, `::character varying`, schema-qualified enum casts) or the
+    /// singleton `CHECK (col = 'a')` — a very common allowlist idiom
+    /// (Rails/TypeORM `validates :col, inclusion: {in: [...]}`-style
+    /// columns, or a table narrowing a shared enum type down to one value).
+    /// `None` when no such constraint exists, or when the table has one but
+    /// it's not this narrow, safely-parseable shape (a cross-column OR, a
+    /// function call, etc). Multiple matching constraints on the same
+    /// column are intersected, same as `check_min`/`check_max`.
+    pub check_allowed_values: Option<Vec<String>>,
     pub nullable: bool,
     pub identity: Identity,
     /// `GENERATED ALWAYS AS (...) STORED` — never written by feint.
@@ -248,6 +260,7 @@ pub async fn introspect(client: &Client, schemas: &[String]) -> Result<Schema> {
                 col.check_min = min;
                 col.check_max = max;
             }
+            col.check_allowed_values = simple_allowed_values(&check_constraints, &col.name);
         }
 
         tables.push(Table {
@@ -452,6 +465,7 @@ async fn list_columns(
             // constraints are known — `list_columns` runs before that.
             check_min: None,
             check_max: None,
+            check_allowed_values: None,
             nullable: !not_null,
             identity,
             is_stored_generated,
@@ -638,6 +652,88 @@ fn simple_integer_bounds(
     (min, max)
 }
 
+/// Matches `pg_get_constraintdef`'s `col = ANY (ARRAY[...])` shape — a
+/// fixed-value allowlist, the standard idiom Rails/TypeORM emit for a
+/// `validates ..., inclusion: {in: [...]}`-style column (`CHECK ((role =
+/// ANY (ARRAY['USER'::text, 'ADMIN'::text])))`). Also matches the cast
+/// variant Postgres emits when the column or array element type needs an
+/// explicit cast to compare (`CHECK (((status)::text = ANY ((ARRAY[...
+/// ::character varying])::text[]))))`), and a single unqualified column
+/// name, optionally quoted/cast, on the left. The array's own contents are
+/// captured as one string and split by [`ARRAY_ITEM_RE`].
+static SIMPLE_ALLOWED_VALUES_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
+    || {
+        regex::Regex::new(
+        r#"^CHECK \(\(\(?\s*"?([A-Za-z_][A-Za-z0-9_]*)"?\s*\)?(?:::[\w". ]+)?\s*=\s*ANY\s*\(\(?ARRAY\[(.*?)\]\)?(?:::[\w". ]+\[\])?\)\)\)$"#,
+    )
+    .expect("valid regex")
+    },
+);
+
+/// Matches the singleton-equality variant of the same idiom — a table
+/// narrowing a column (often a shared enum type) down to exactly one legal
+/// value, e.g. NodeBB's `CHECK ((type = 'set'::public.legacy_object_type))`
+/// or Penpot's `CHECK ((type = 'oidc'::text))`.
+static SIMPLE_TEXT_EQ_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r#"^CHECK \(\(\(?\s*"?([A-Za-z_][A-Za-z0-9_]*)"?\s*\)?(?:::[\w". ]+)?\s*=\s*'((?:[^']|'')*)'(?:::[\w". ]+)?\)\)$"#,
+    )
+    .expect("valid regex")
+});
+
+/// One single-quoted string literal (with `''` as Postgres's escaped
+/// single quote), ignoring any trailing `::cast` — used to split
+/// `SIMPLE_ALLOWED_VALUES_RE`'s captured array contents into individual
+/// values.
+static ARRAY_ITEM_RE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r#"'((?:[^']|'')*)'"#).expect("valid regex"));
+
+/// The fixed set of legal values for `column_name` narrowed from every
+/// simple, single-column allowlist CHECK constraint on `table` that
+/// mentions it (`col = ANY (ARRAY[...])` or singleton `col = 'x'`).
+/// Multiple matching constraints on the same column are intersected, same
+/// as [`simple_integer_bounds`]. Returns `None` when nothing matches, or
+/// when an intersection across multiple constraints leaves no values at
+/// all (a contradiction that shouldn't occur in a real schema, but falls
+/// back to "no narrowing" rather than generating into a value that can
+/// never satisfy every constraint).
+fn simple_allowed_values(
+    check_constraints: &[CheckConstraint],
+    column_name: &str,
+) -> Option<Vec<String>> {
+    let mut allowed: Option<Vec<String>> = None;
+    for c in check_constraints {
+        let def = c.definition.trim();
+        let values: Vec<String> = if let Some(caps) = SIMPLE_ALLOWED_VALUES_RE.captures(def) {
+            if &caps[1] != column_name {
+                continue;
+            }
+            ARRAY_ITEM_RE
+                .captures_iter(&caps[2])
+                .map(|m| m[1].replace("''", "'"))
+                .collect()
+        } else if let Some(caps) = SIMPLE_TEXT_EQ_RE.captures(def) {
+            if &caps[1] != column_name {
+                continue;
+            }
+            vec![caps[2].replace("''", "'")]
+        } else {
+            continue;
+        };
+        if values.is_empty() {
+            continue;
+        }
+        allowed = Some(match allowed {
+            None => values,
+            Some(existing) => existing
+                .into_iter()
+                .filter(|v| values.contains(v))
+                .collect(),
+        });
+    }
+    allowed.filter(|v| !v.is_empty())
+}
+
 async fn list_check_constraints(client: &Client, table_oid: u32) -> Result<Vec<CheckConstraint>> {
     let rows = client
         .query(
@@ -655,4 +751,163 @@ async fn list_check_constraints(client: &Client, table_oid: u32) -> Result<Vec<C
             definition: row.get(1),
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(name: &str, definition: &str) -> CheckConstraint {
+        CheckConstraint {
+            name: name.to_string(),
+            definition: definition.to_string(),
+        }
+    }
+
+    #[test]
+    fn plain_any_array_allowlist_is_extracted() {
+        let constraints = vec![check(
+            "users_role_check",
+            "CHECK ((role = ANY (ARRAY['USER'::text, 'ADMIN'::text])))",
+        )];
+        assert_eq!(
+            simple_allowed_values(&constraints, "role"),
+            Some(vec!["USER".to_string(), "ADMIN".to_string()])
+        );
+    }
+
+    #[test]
+    fn cast_any_array_allowlist_is_extracted() {
+        // n8n's shape: column cast to ::text, array elements cast to
+        // ::character varying, whole array cast to ::text[].
+        let constraints = vec![check(
+            "CHK_workflow_publication_outbox_status",
+            "CHECK (((status)::text = ANY ((ARRAY['pending'::character varying, \
+             'failed'::character varying])::text[])))",
+        )];
+        assert_eq!(
+            simple_allowed_values(&constraints, "status"),
+            Some(vec!["pending".to_string(), "failed".to_string()])
+        );
+    }
+
+    #[test]
+    fn single_element_any_array_allowlist_is_extracted() {
+        let constraints = vec![check(
+            "project_settings_project_mode_values",
+            "CHECK ((project_mode = ANY (ARRAY['open'::text])))",
+        )];
+        assert_eq!(
+            simple_allowed_values(&constraints, "project_mode"),
+            Some(vec!["open".to_string()])
+        );
+    }
+
+    #[test]
+    fn quoted_mixed_case_column_name_is_matched() {
+        let constraints = vec![check(
+            "workspace_activation_status_check",
+            "CHECK ((\"activationStatus\" = ANY (ARRAY['PENDING'::text, 'ACTIVE'::text])))",
+        )];
+        assert_eq!(
+            simple_allowed_values(&constraints, "activationStatus"),
+            Some(vec!["PENDING".to_string(), "ACTIVE".to_string()])
+        );
+    }
+
+    #[test]
+    fn singleton_equality_allowlist_is_extracted() {
+        let constraints = vec![check(
+            "sso_provider_type_check",
+            "CHECK ((type = 'oidc'::text))",
+        )];
+        assert_eq!(
+            simple_allowed_values(&constraints, "type"),
+            Some(vec!["oidc".to_string()])
+        );
+    }
+
+    #[test]
+    fn singleton_equality_with_schema_qualified_enum_cast_is_extracted() {
+        let constraints = vec![check(
+            "legacy_set_type_check",
+            "CHECK ((type = 'set'::public.legacy_object_type))",
+        )];
+        assert_eq!(
+            simple_allowed_values(&constraints, "type"),
+            Some(vec!["set".to_string()])
+        );
+    }
+
+    #[test]
+    fn singleton_equality_with_column_cast_is_extracted() {
+        let constraints = vec![check(
+            "ck_chart_datasource",
+            "CHECK (((datasource_type)::text = 'table'::text))",
+        )];
+        assert_eq!(
+            simple_allowed_values(&constraints, "datasource_type"),
+            Some(vec!["table".to_string()])
+        );
+    }
+
+    #[test]
+    fn wrong_column_name_is_ignored() {
+        let constraints = vec![check(
+            "users_role_check",
+            "CHECK ((role = ANY (ARRAY['USER'::text, 'ADMIN'::text])))",
+        )];
+        assert_eq!(simple_allowed_values(&constraints, "status"), None);
+    }
+
+    #[test]
+    fn cross_column_or_expression_is_not_matched() {
+        // Twenty's real shape: an allowlist ORed with an unrelated
+        // condition — deliberately left unmatched, same "don't guess"
+        // stance as the cross-column CHECK limitation generally.
+        let constraints = vec![check(
+            "workspace_check",
+            "CHECK (((\"activationStatus\" = ANY (ARRAY['PENDING_CREATION'::text, \
+             'ONGOING_CREATION'::text])) OR (\"defaultRoleId\" IS NOT NULL)))",
+        )];
+        assert_eq!(
+            simple_allowed_values(&constraints, "activationStatus"),
+            None
+        );
+    }
+
+    #[test]
+    fn escaped_single_quote_in_allowed_value_is_unescaped() {
+        let constraints = vec![check(
+            "labels_check",
+            "CHECK ((label = ANY (ARRAY['can''t stop'::text, 'ok'::text])))",
+        )];
+        assert_eq!(
+            simple_allowed_values(&constraints, "label"),
+            Some(vec!["can't stop".to_string(), "ok".to_string()])
+        );
+    }
+
+    #[test]
+    fn multiple_constraints_on_same_column_are_intersected() {
+        let constraints = vec![
+            check(
+                "c1",
+                "CHECK ((role = ANY (ARRAY['USER'::text, 'ADMIN'::text, 'GUEST'::text])))",
+            ),
+            check(
+                "c2",
+                "CHECK ((role = ANY (ARRAY['ADMIN'::text, 'GUEST'::text])))",
+            ),
+        ];
+        assert_eq!(
+            simple_allowed_values(&constraints, "role"),
+            Some(vec!["ADMIN".to_string(), "GUEST".to_string()])
+        );
+    }
+
+    #[test]
+    fn no_matching_constraint_returns_none() {
+        assert_eq!(simple_allowed_values(&[], "role"), None);
+    }
 }

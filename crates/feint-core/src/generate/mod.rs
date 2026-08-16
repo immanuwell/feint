@@ -47,6 +47,17 @@ pub fn generate_value(
     override_generator: Option<&str>,
     rng: &mut ChaCha8Rng,
 ) -> Result<PgValue> {
+    // A `col = ANY (ARRAY[...])`/singleton `col = 'x'` CHECK constraint is a
+    // hard database constraint, not a nicety like the name heuristic below
+    // — picking from it takes priority over every other unconfigured path,
+    // same as `check_min`/`check_max` narrowing an int range. Only skipped
+    // when the user explicitly configured a different generator, or the
+    // column's type can't represent one of the allowed values directly.
+    if override_generator.is_none() {
+        if let Some(value) = allowed_value(column, rng) {
+            return Ok(truncate_to_column_length(value, column));
+        }
+    }
     let heuristic_name = name_heuristic(&column.name).filter(|_| is_text_like(column));
     let value = if let Some(name) = override_generator {
         dispatch_named(name, column, rng)?
@@ -81,6 +92,35 @@ fn is_text_like(column: &Column) -> bool {
         TypeKind::Domain { base_type } => is_text_type_name(base_type),
         _ => false,
     }
+}
+
+/// Picks uniformly from `column.check_allowed_values` when the column's
+/// type can represent one of them directly: a plain text-like scalar/
+/// domain gets a `PgValue::Text`, an enum gets a `PgValue::Enum` built from
+/// whichever allowed values are actually among the enum's own declared
+/// labels (a table can narrow a shared enum type down to a subset — e.g.
+/// NodeBB's `legacy_set.type`, whose CHECK narrows a multi-label enum down
+/// to exactly `'set'`). `None` for every other type, an empty/no-overlap
+/// allowlist, or when the column has no such CHECK at all — the caller
+/// falls through to the normal heuristic/type dispatch in every such case.
+fn allowed_value(column: &Column, rng: &mut ChaCha8Rng) -> Option<PgValue> {
+    let allowed = column.check_allowed_values.as_ref()?;
+    if let TypeKind::Enum(variants) = &column.type_kind {
+        let matching: Vec<&String> = allowed.iter().filter(|v| variants.contains(v)).collect();
+        if matching.is_empty() {
+            return None;
+        }
+        let idx = rng.gen_range(0..matching.len());
+        return Some(PgValue::Enum(
+            column.type_name.clone(),
+            matching[idx].clone(),
+        ));
+    }
+    if is_text_like(column) && !allowed.is_empty() {
+        let idx = rng.gen_range(0..allowed.len());
+        return Some(PgValue::Text(allowed[idx].clone()));
+    }
+    None
 }
 
 /// `varchar(N)`/`bpchar(N)` columns reject a value longer than `N`
@@ -300,6 +340,7 @@ fn placeholder_column(type_name: &str, nullable: bool) -> Column {
         numeric_scale: None,
         check_min: None,
         check_max: None,
+        check_allowed_values: None,
         nullable,
         identity: crate::introspect::Identity::None,
         is_stored_generated: false,
@@ -615,6 +656,7 @@ mod tests {
             numeric_scale: None,
             check_min: None,
             check_max: None,
+            check_allowed_values: None,
             nullable: false,
             identity: Identity::None,
             is_stored_generated: false,
@@ -688,6 +730,78 @@ mod tests {
                 assert!(["sad", "ok", "happy"].contains(&label.as_str()));
             }
             other => panic!("expected Enum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_allowed_values_narrows_a_text_column_to_the_allowlist() {
+        let col = Column {
+            check_allowed_values: Some(vec!["USER".to_string(), "ADMIN".to_string()]),
+            ..text_column("role")
+        };
+        let mut rng = derive_rng(
+            "seed",
+            &SeedKey {
+                table: "users",
+                column: "role",
+                row_identity: "0",
+            },
+        );
+        let v = generate_value(&col, None, &mut rng).unwrap();
+        match v {
+            PgValue::Text(s) => assert!(["USER", "ADMIN"].contains(&s.as_str())),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_allowed_values_narrows_an_enum_column_to_the_overlapping_subset() {
+        // NodeBB's real shape: a CHECK narrows a multi-label enum down to
+        // exactly one legal value for this table.
+        let col = Column {
+            type_kind: TypeKind::Enum(vec!["set".into(), "hash".into(), "list".into()]),
+            type_name: "legacy_object_type".to_string(),
+            check_allowed_values: Some(vec!["set".to_string()]),
+            ..text_column("type")
+        };
+        let mut rng = derive_rng(
+            "seed",
+            &SeedKey {
+                table: "legacy_set",
+                column: "type",
+                row_identity: "0",
+            },
+        );
+        let v = generate_value(&col, None, &mut rng).unwrap();
+        match v {
+            PgValue::Enum(ty, label) => {
+                assert_eq!(ty, "legacy_object_type");
+                assert_eq!(label, "set");
+            }
+            other => panic!("expected Enum, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn explicit_override_generator_bypasses_check_allowed_values() {
+        // An explicit `feint.yaml` override always wins, same as it does
+        // over the name heuristic.
+        let col = Column {
+            check_allowed_values: Some(vec!["USER".to_string()]),
+            ..text_column("role")
+        };
+        let mut rng = derive_rng(
+            "seed",
+            &SeedKey {
+                table: "users",
+                column: "role",
+                row_identity: "0",
+            },
+        );
+        let v = generate_value(&col, Some("first_name"), &mut rng).unwrap();
+        match v {
+            PgValue::Text(s) => assert_ne!(s, "USER"),
+            other => panic!("expected Text, got {other:?}"),
         }
     }
 

@@ -271,6 +271,7 @@ mod tests {
             numeric_scale: None,
             check_min: None,
             check_max: None,
+            check_allowed_values: None,
             nullable: true,
             identity: crate::introspect::Identity::None,
             is_stored_generated: false,

@@ -408,6 +408,7 @@ mod tests {
                 numeric_scale: None,
                 check_min: None,
                 check_max: None,
+                check_allowed_values: None,
                 nullable: false,
                 identity: Identity::None,
                 is_stored_generated: false,
