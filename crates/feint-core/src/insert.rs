@@ -42,18 +42,44 @@ pub(crate) struct RefPool {
 }
 
 impl RefPool {
+    /// A unique constraint/index's column order need not match the order
+    /// an FK lists its referenced columns in — Postgres matches them as a
+    /// set, not left-to-right (fider's `users` has `UNIQUE (tenant_id,
+    /// id)` satisfying `REFERENCES users(id, tenant_id)`). Pools are keyed
+    /// and stored in a canonical (sorted) column order so registration and
+    /// sampling agree regardless of which order each call site's column
+    /// list happens to be in; `reorder` then permutes a tuple between the
+    /// canonical order and whatever order a given call site wants.
+    fn canonical(columns: &[String]) -> Vec<String> {
+        let mut sorted = columns.to_vec();
+        sorted.sort();
+        sorted
+    }
+
+    fn reorder(tuple: &[PgValue], from: &[String], to: &[String]) -> Vec<PgValue> {
+        to.iter()
+            .map(|c| {
+                let idx = from.iter().position(|f| f == c).expect("same column set");
+                tuple[idx].clone()
+            })
+            .collect()
+    }
+
     /// `pub(crate)`: also called directly from `clone.rs` to register a
     /// hybrid run's already-known real (masked) primary keys, which need
     /// no `RETURNING` round trip the way GENERATE mode's server-assigned
-    /// keys do.
+    /// keys do. `columns`/`tuple` may be in any order; they're stored
+    /// under the canonical sort order regardless.
     pub(crate) fn register(&mut self, table: &TableId, columns: &[String], tuple: Vec<PgValue>) {
         if tuple.iter().any(PgValue::is_null) {
             // A NULL participant can't satisfy MATCH SIMPLE FK lookups
             // reliably as a sampled target; skip registering it.
             return;
         }
+        let canonical = Self::canonical(columns);
+        let tuple = Self::reorder(&tuple, columns, &canonical);
         self.pools
-            .entry((table.clone(), columns.to_vec()))
+            .entry((table.clone(), canonical))
             .or_default()
             .push(tuple);
     }
@@ -64,22 +90,72 @@ impl RefPool {
         columns: &[String],
         rng: &mut rand_chacha::ChaCha8Rng,
     ) -> Option<Vec<PgValue>> {
-        let key = (table.clone(), columns.to_vec());
-        let pool = self.pools.get(&key)?;
-        if pool.is_empty() {
+        self.sample_pinned(table, columns, &[], rng)
+    }
+
+    /// Like `sample`, but `pins` (a list of `(index into columns, required
+    /// value)`) restricts the draw to tuples that agree on those
+    /// positions. Needed when two of a row's composite FKs share a
+    /// discriminator column — fider's `post_votes` has both
+    /// `(post_id, tenant_id) -> posts(id, tenant_id)` and `(user_id,
+    /// tenant_id) -> users(id, tenant_id)`; sampling each independently
+    /// picks two different tenants and the second draw's write clobbers
+    /// the first's `tenant_id`, producing a row whose `(post_id,
+    /// tenant_id)` pair never actually co-occurred in `posts`. Pinning the
+    /// already-decided `tenant_id` when resolving the second FK keeps
+    /// every composite FK on the row pointing at the same tenant.
+    fn sample_pinned(
+        &self,
+        table: &TableId,
+        columns: &[String],
+        pins: &[(usize, PgValue)],
+        rng: &mut rand_chacha::ChaCha8Rng,
+    ) -> Option<Vec<PgValue>> {
+        let canonical = Self::canonical(columns);
+        let pool = self.pools.get(&(table.clone(), canonical.clone()))?;
+        if pins.is_empty() {
+            if pool.is_empty() {
+                return None;
+            }
+            let idx = rng.gen_range(0..pool.len());
+            return Some(Self::reorder(&pool[idx], &canonical, columns));
+        }
+        let canon_pins: Vec<(usize, &PgValue)> = pins
+            .iter()
+            .map(|(i, v)| {
+                let ci = canonical
+                    .iter()
+                    .position(|c| c == &columns[*i])
+                    .expect("same column set");
+                (ci, v)
+            })
+            .collect();
+        let matches: Vec<&Vec<PgValue>> = pool
+            .iter()
+            .filter(|t| canon_pins.iter().all(|(ci, v)| &t[*ci] == *v))
+            .collect();
+        if matches.is_empty() {
             return None;
         }
-        let idx = rng.gen_range(0..pool.len());
-        Some(pool[idx].clone())
+        let idx = rng.gen_range(0..matches.len());
+        Some(Self::reorder(matches[idx], &canonical, columns))
     }
 
     /// Every tuple registered for `(table, columns)`, in registration
-    /// order. Used for profile-driven cardinality generation, which needs
-    /// to visit each parent row exactly once (to decide its own number of
-    /// children) rather than sampling one at random.
-    pub(crate) fn all(&self, table: &TableId, columns: &[String]) -> &[Vec<PgValue>] {
-        let key = (table.clone(), columns.to_vec());
-        self.pools.get(&key).map(Vec::as_slice).unwrap_or(&[])
+    /// order and reordered to match `columns`. Used for profile-driven
+    /// cardinality generation, which needs to visit each parent row
+    /// exactly once (to decide its own number of children) rather than
+    /// sampling one at random.
+    pub(crate) fn all(&self, table: &TableId, columns: &[String]) -> Vec<Vec<PgValue>> {
+        let canonical = Self::canonical(columns);
+        self.pools
+            .get(&(table.clone(), canonical.clone()))
+            .map(|pool| {
+                pool.iter()
+                    .map(|t| Self::reorder(t, &canonical, columns))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -322,7 +398,17 @@ fn generate_row(
                 row_identity,
             },
         );
-        match ref_pool.sample(&fk.ref_table, &fk.ref_columns, &mut rng) {
+        // A column an earlier FK on this same row already wrote (a shared
+        // tenant/workspace discriminator, typically) must stay pinned to
+        // that value — otherwise this FK's draw silently overwrites it
+        // with an unrelated one. See `RefPool::sample_pinned`.
+        let pins: Vec<(usize, PgValue)> = fk
+            .columns
+            .iter()
+            .enumerate()
+            .filter_map(|(i, c)| values.get(c).map(|v| (i, v.clone())))
+            .collect();
+        match ref_pool.sample_pinned(&fk.ref_table, &fk.ref_columns, &pins, &mut rng) {
             Some(tuple) => {
                 for (col, val) in fk.columns.iter().zip(tuple) {
                     values.insert(col.clone(), val);
@@ -337,6 +423,19 @@ fn generate_row(
                     for c in &fk.columns {
                         values.insert(c.clone(), PgValue::Null);
                     }
+                } else if !pins.is_empty()
+                    && ref_pool
+                        .sample(&fk.ref_table, &fk.ref_columns, &mut rng)
+                        .is_some()
+                {
+                    return Err(FeintError::Config(format!(
+                        "table `{}` has multiple foreign keys sharing a column (via `{}`), but no row in `{}` \
+                         matches the value another foreign key on this row already fixed (increase its `rows:` \
+                         in feint.yaml so every shared value has a matching row in every referenced table)",
+                        table.id.qualified(),
+                        fk.name,
+                        fk.ref_table.qualified()
+                    )));
                 } else {
                     return Err(FeintError::Config(format!(
                         "table `{}` needs at least one row in `{}` to satisfy foreign key `{}`, but none exist \
@@ -772,9 +871,7 @@ async fn insert_plain_table_with_cardinality(
     // still goes through `generate_row`'s normal sampling — its pick for
     // `driving_fk` just gets overwritten below), so this shared borrow
     // and the later mutable one for registration don't overlap.
-    let parents: Vec<Vec<PgValue>> = ref_pool
-        .all(&driving_fk.ref_table, &driving_fk.ref_columns)
-        .to_vec();
+    let parents: Vec<Vec<PgValue>> = ref_pool.all(&driving_fk.ref_table, &driving_fk.ref_columns);
 
     let fk_positions: Vec<usize> = driving_fk
         .columns
@@ -1280,7 +1377,42 @@ pub(crate) async fn insert_deferred_group(
                             }
                         }
                     }
-                    None if pool_was_empty => {} // leave NULL, as before
+                    None if pool_was_empty => {
+                        // Every other table in the cycle is registered in
+                        // `ref_pool` by the time pass 2 runs (pass 1 built
+                        // every table's rows before this loop started), so
+                        // an empty pool here means the *other* side's own
+                        // matching unique-constraint tuple never got
+                        // registered — almost always because that side's
+                        // relevant columns were themselves skipped as
+                        // cyclic (Matrix Synapse's `worker_read_write_locks`
+                        // <-> `worker_read_write_locks_mode`, which resolve
+                        // through the *same* `lock_name`/`lock_key`
+                        // columns on both sides, so neither ever anchors
+                        // the other). Leaving NULL here is only safe if
+                        // the column tolerates it — otherwise this becomes
+                        // a raw NOT NULL violation at the INSERT below,
+                        // with none of this cycle's context in the error.
+                        let not_null: Vec<&str> = fk
+                            .columns
+                            .iter()
+                            .filter(|c| table.column(c).map(|col| !col.nullable).unwrap_or(false))
+                            .map(String::as_str)
+                            .collect();
+                        if !not_null.is_empty() {
+                            return Err(FeintError::Config(format!(
+                                "table `{}` has a deferrable foreign-key cycle through `{}`, but neither \
+                                 side ever has a matching row to resolve `{}` (NOT NULL: {}) against — the \
+                                 cycle has no independently-generatable anchor. Make {} nullable, or break \
+                                 the cycle with a different, independently-resolvable edge.",
+                                table_id.qualified(),
+                                fk.ref_table.qualified(),
+                                fk.name,
+                                not_null.join(", "),
+                                if not_null.len() == 1 { "it" } else { "them" }
+                            )));
+                        }
+                    } // leave NULL, as before
                     None => {
                         return Err(FeintError::Config(format!(
                             "table `{}` couldn't resolve cyclic foreign key `{}` for row {} without \
