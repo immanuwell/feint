@@ -455,6 +455,7 @@ pub async fn run(
             InsertGroup::Backfill {
                 tables,
                 null_then_backfill,
+                self_referencing,
             } => {
                 if tables
                     .first()
@@ -465,6 +466,7 @@ pub async fn run(
                         schema,
                         tables,
                         null_then_backfill,
+                        self_referencing,
                         config,
                         None,
                         &mut ref_pool,

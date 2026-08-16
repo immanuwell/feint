@@ -32,7 +32,15 @@ pub async fn run(database_url: &str, config_path: &Path, schemas: &[String]) -> 
                 let label = match group {
                     InsertGroup::Simple(_) => None,
                     InsertGroup::Deferred(_) => Some("deferred cycle"),
-                    InsertGroup::Backfill { .. } => Some("null+backfill cycle"),
+                    InsertGroup::Backfill {
+                        self_referencing, ..
+                    } => {
+                        if self_referencing.is_empty() {
+                            Some("null+backfill cycle")
+                        } else {
+                            Some("null+backfill cycle, self-referencing")
+                        }
+                    }
                     InsertGroup::SelfReferencing(_) => Some("self-referencing, sequence-anchored"),
                 };
                 for table in group.tables() {

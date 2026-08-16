@@ -256,6 +256,7 @@ pub async fn restore(
             InsertGroup::Backfill {
                 tables,
                 null_then_backfill,
+                self_referencing: _,
             } => {
                 let n = restore_backfill_group(
                     target_txn,

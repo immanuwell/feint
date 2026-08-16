@@ -247,12 +247,14 @@ pub async fn run(
             InsertGroup::Backfill {
                 tables,
                 null_then_backfill,
+                self_referencing,
             } => {
                 let n = insert_backfill_group(
                     txn,
                     schema,
                     tables,
                     null_then_backfill,
+                    self_referencing,
                     config,
                     profile,
                     &mut ref_pool,
@@ -1008,52 +1010,33 @@ async fn prefetch_sequence_values(
         .collect())
 }
 
-/// A table whose only cyclic dependency is a self-referencing FK on a
-/// sequence-backed server-assigned column (almost always its own PK) —
-/// `InsertGroup::SelfReferencing`. feint never otherwise knows a row's
-/// own serial/identity value until *after* insert (via `RETURNING`), by
-/// which point any self-reference on that same row would already have
-/// had to be written — so a self-reference can never get a real value
-/// through the normal generate-then-insert flow, regardless of
-/// nullability or deferrability. Real hand-written seed scripts solve
-/// this the same way: reserve primary keys from the sequence up front and
-/// write them explicitly. This does that — pre-fetches `planned_rows`
-/// values via `nextval()`, writes them into each row's own PK column
-/// explicitly (bypassing `DEFAULT`, using `OVERRIDING SYSTEM VALUE` for a
-/// `GENERATED ALWAYS AS IDENTITY` column), and resolves every
-/// self-referencing column by sampling among the ids already decided for
-/// rows `0..=i` (including the row's own) — always valid, since Postgres
-/// only checks a non-deferrable FK once the whole triggering `INSERT`
-/// statement's rows already exist, and any earlier row is already
-/// committed within this transaction by the time a later chunk's
-/// `INSERT` runs.
-pub(crate) async fn insert_self_referencing_table(
-    txn: &Transaction<'_>,
-    table: &Table,
-    planned_rows: u32,
-    config: &FeintConfig,
-    profile: Option<&crate::profile::ProfileFile>,
-    ref_pool: &mut RefPool,
-    is_referenced: bool,
-) -> Result<u64> {
-    let empty = std::collections::BTreeMap::new();
-    let overrides = config
-        .table_config(&table.id.qualified())
-        .map(|t| &t.columns)
-        .unwrap_or(&empty);
-
-    let self_fks: Vec<&ForeignKey> = table
+/// The local (referencing) columns of every self-referencing FK on `table`
+/// — i.e. every FK whose `ref_table` is `table` itself.
+fn self_referencing_fks(table: &Table) -> Vec<&ForeignKey> {
+    table
         .foreign_keys
         .iter()
         .filter(|fk| fk.ref_table == table.id)
-        .collect();
-    let self_fk_columns: HashSet<String> = self_fks
-        .iter()
-        .flat_map(|fk| fk.columns.iter().cloned())
-        .collect();
+        .collect()
+}
 
+/// Reserves `nextval()` values for every column a self-referencing FK on
+/// `table` points at (almost always just its own PK), and extends
+/// `supplied_columns(table)` with those columns so they get written
+/// explicitly instead of left to `DEFAULT`. Shared by
+/// `insert_self_referencing_table` (a table whose *only* cyclic dependency
+/// is on itself) and `insert_backfill_group` (a table whose self-loop
+/// coexists with genuine cross-table cyclic edges, e.g. Zammad's `users`)
+/// — both need the identical up-front reservation, just as part of a
+/// different surrounding insertion strategy.
+async fn prefetch_self_referencing<'a>(
+    txn: &Transaction<'_>,
+    table: &'a Table,
+    self_fks: &[&ForeignKey],
+    planned_rows: u32,
+) -> Result<(Vec<&'a Column>, bool, HashMap<String, Vec<PgValue>>)> {
     let mut prefetch_col_names: Vec<String> = Vec::new();
-    for fk in &self_fks {
+    for fk in self_fks {
         for c in &fk.ref_columns {
             if !prefetch_col_names.contains(c) {
                 prefetch_col_names.push(c.clone());
@@ -1093,6 +1076,95 @@ pub(crate) async fn insert_self_referencing_table(
     }
     columns.sort_by_key(|c| c.position);
 
+    Ok((columns, needs_overriding, prefetched))
+}
+
+/// Fills in row `i`'s prefetched ref-column value(s) and resolves every
+/// self-referencing FK on it by sampling among the ids already decided for
+/// rows `0..=i` (including the row's own) — always valid, since Postgres
+/// only checks a non-deferrable FK once the whole triggering `INSERT`
+/// statement's rows already exist, and any earlier row is already
+/// committed within this transaction by the time a later chunk's `INSERT`
+/// runs. `row` must have been generated with every self-fk's local column
+/// in the caller's skip set (left NULL), and `columns` must be the
+/// `prefetch_self_referencing`-extended list so the prefetched ref
+/// column(s) have a slot to write into.
+fn apply_self_referencing_values(
+    row: &mut [PgValue],
+    columns: &[&Column],
+    self_fks: &[&ForeignKey],
+    prefetched: &HashMap<String, Vec<PgValue>>,
+    table_name: &str,
+    global_seed: &str,
+    i: u32,
+) {
+    for (col_name, values) in prefetched {
+        let pos = columns
+            .iter()
+            .position(|c| &c.name == col_name)
+            .expect("prefetched column was added to the supplied list above");
+        row[pos] = values[i as usize].clone();
+    }
+
+    for fk in self_fks {
+        let mut rng = derive_rng(
+            global_seed,
+            &SeedKey {
+                table: table_name,
+                column: &fk.name,
+                row_identity: &i.to_string(),
+            },
+        );
+        let pick = rng.gen_range(0..=i as usize);
+        for (local_col, ref_col) in fk.columns.iter().zip(&fk.ref_columns) {
+            let pos = columns
+                .iter()
+                .position(|c| &c.name == local_col)
+                .expect("self-fk column was added to the supplied list above");
+            row[pos] = prefetched[ref_col][pick].clone();
+        }
+    }
+}
+
+/// A table whose only cyclic dependency is a self-referencing FK on a
+/// sequence-backed server-assigned column (almost always its own PK) —
+/// `InsertGroup::SelfReferencing`. feint never otherwise knows a row's
+/// own serial/identity value until *after* insert (via `RETURNING`), by
+/// which point any self-reference on that same row would already have
+/// had to be written — so a self-reference can never get a real value
+/// through the normal generate-then-insert flow, regardless of
+/// nullability or deferrability. Real hand-written seed scripts solve
+/// this the same way: reserve primary keys from the sequence up front and
+/// write them explicitly. This does that — pre-fetches `planned_rows`
+/// values via `nextval()`, writes them into each row's own PK column
+/// explicitly (bypassing `DEFAULT`, using `OVERRIDING SYSTEM VALUE` for a
+/// `GENERATED ALWAYS AS IDENTITY` column), and resolves every
+/// self-referencing column the same way `apply_self_referencing_values`
+/// does for a self-referencing table inside a larger `Backfill` group.
+pub(crate) async fn insert_self_referencing_table(
+    txn: &Transaction<'_>,
+    table: &Table,
+    planned_rows: u32,
+    config: &FeintConfig,
+    profile: Option<&crate::profile::ProfileFile>,
+    ref_pool: &mut RefPool,
+    is_referenced: bool,
+) -> Result<u64> {
+    let empty = std::collections::BTreeMap::new();
+    let overrides = config
+        .table_config(&table.id.qualified())
+        .map(|t| &t.columns)
+        .unwrap_or(&empty);
+
+    let self_fks = self_referencing_fks(table);
+    let self_fk_columns: HashSet<String> = self_fks
+        .iter()
+        .flat_map(|fk| fk.columns.iter().cloned())
+        .collect();
+
+    let (columns, needs_overriding, prefetched) =
+        prefetch_self_referencing(txn, table, &self_fks, planned_rows).await?;
+
     let key_sets = unique_key_index_sets_excluding(table, &columns, &self_fk_columns);
     let mut seen: Vec<Vec<Vec<PgValue>>> = vec![Vec::new(); key_sets.len()];
 
@@ -1112,32 +1184,15 @@ pub(crate) async fn insert_self_referencing_table(
             &mut seen,
         )?;
 
-        for (col_name, values) in &prefetched {
-            let pos = columns
-                .iter()
-                .position(|c| &c.name == col_name)
-                .expect("prefetched column was added to the supplied list above");
-            row[pos] = values[i as usize].clone();
-        }
-
-        for fk in &self_fks {
-            let mut rng = derive_rng(
-                &config.seed,
-                &SeedKey {
-                    table: &table_name,
-                    column: &fk.name,
-                    row_identity: &i.to_string(),
-                },
-            );
-            let pick = rng.gen_range(0..=i as usize);
-            for (local_col, ref_col) in fk.columns.iter().zip(&fk.ref_columns) {
-                let pos = columns
-                    .iter()
-                    .position(|c| &c.name == local_col)
-                    .expect("self-fk column was added to the supplied list above");
-                row[pos] = prefetched[ref_col][pick].clone();
-            }
-        }
+        apply_self_referencing_values(
+            &mut row,
+            &columns,
+            &self_fks,
+            &prefetched,
+            &table_name,
+            &config.seed,
+            i,
+        );
 
         rows.push(row);
     }
@@ -1161,6 +1216,7 @@ pub(crate) async fn insert_backfill_group(
     schema: &Schema,
     tables: &[TableId],
     null_then_backfill: &[FkRef],
+    self_referencing: &[FkRef],
     config: &FeintConfig,
     profile: Option<&crate::profile::ProfileFile>,
     ref_pool: &mut RefPool,
@@ -1172,6 +1228,13 @@ pub(crate) async fn insert_backfill_group(
             .entry(r.table.clone())
             .or_default()
             .extend(r.fk.columns.iter().cloned());
+    }
+    let mut self_refs_by_table: HashMap<TableId, Vec<&ForeignKey>> = HashMap::new();
+    for r in self_referencing {
+        self_refs_by_table
+            .entry(r.table.clone())
+            .or_default()
+            .push(&r.fk);
     }
 
     let mut results = Vec::new();
@@ -1200,14 +1263,29 @@ pub(crate) async fn insert_backfill_group(
             .table_config(&table_id.qualified())
             .map(|t| &t.columns)
             .unwrap_or(&empty);
-        let skip = skip_by_table.get(table_id).cloned().unwrap_or_default();
-        let columns = supplied_columns(table);
-        let key_sets = unique_key_index_sets(table, &columns);
+        let self_refs = self_refs_by_table
+            .get(table_id)
+            .cloned()
+            .unwrap_or_default();
+        let self_ref_columns: HashSet<String> = self_refs
+            .iter()
+            .flat_map(|fk| fk.columns.iter().cloned())
+            .collect();
+        let (columns, needs_overriding, prefetched) = if self_refs.is_empty() {
+            (supplied_columns(table), false, HashMap::new())
+        } else {
+            prefetch_self_referencing(txn, table, &self_refs, planned_rows).await?
+        };
+
+        let mut skip = skip_by_table.get(table_id).cloned().unwrap_or_default();
+        skip.extend(self_ref_columns.iter().cloned());
+        let key_sets = unique_key_index_sets_excluding(table, &columns, &self_ref_columns);
         let mut seen: Vec<Vec<Vec<PgValue>>> = vec![Vec::new(); key_sets.len()];
 
+        let table_name = table_id.qualified();
         let mut rows = Vec::with_capacity(planned_rows as usize);
         for i in 0..planned_rows {
-            rows.push(generate_unique_row(
+            let mut row = generate_unique_row(
                 table,
                 &columns,
                 i as u64,
@@ -1218,7 +1296,19 @@ pub(crate) async fn insert_backfill_group(
                 profile,
                 &key_sets,
                 &mut seen,
-            )?);
+            )?;
+            if !self_refs.is_empty() {
+                apply_self_referencing_values(
+                    &mut row,
+                    &columns,
+                    &self_refs,
+                    &prefetched,
+                    &table_name,
+                    &config.seed,
+                    i,
+                );
+            }
+            rows.push(row);
         }
 
         let pk_cols = table
@@ -1237,7 +1327,8 @@ pub(crate) async fn insert_backfill_group(
         }
 
         let returned =
-            execute_batched_insert(txn, table, &columns, &rows, &returning, false).await?;
+            execute_batched_insert(txn, table, &columns, &rows, &returning, needs_overriding)
+                .await?;
         register_returned(ref_pool, table, &returning, &returned);
 
         let pk_indices: Vec<usize> = pk_cols

@@ -59,20 +59,36 @@ pub enum InsertGroup {
     Deferred(Vec<TableId>),
     /// Tables forming a cycle, resolved by inserting the cyclic FK
     /// column(s) as NULL first, then backfilling via UPDATE once every row
-    /// in the group exists.
+    /// in the group exists. `self_referencing` carries any sequence-backed
+    /// self-loop edges within the group (a table referencing its own PK,
+    /// coexisting with genuine cross-table edges) — e.g. Zammad's `users`
+    /// <-> `organizations`: `users.created_by_id`/`updated_by_id` are
+    /// NOT NULL self-loops on `users.id`, while `organizations.created_by_id`/
+    /// `updated_by_id` are NOT NULL cross-table edges to `users`, and
+    /// `users.organization_id` is a nullable cross-table edge to
+    /// `organizations`. These self-loop edges never participate in
+    /// `tables`' ordering or `null_then_backfill` — they're always
+    /// resolvable via up-front `nextval()` reservation regardless of
+    /// nullability, the same trick `SelfReferencing` below uses for a
+    /// single table, just applied per-table inside a larger group. See
+    /// `insert_backfill_group`.
     Backfill {
         tables: Vec<TableId>,
         null_then_backfill: Vec<FkRef>,
+        self_referencing: Vec<FkRef>,
     },
     /// A single table whose only cyclic dependency is on itself, through a
     /// column that's server-assigned but backed by a real sequence (a
     /// plain serial default or `GENERATED ALWAYS AS IDENTITY`) — e.g.
-    /// Zammad's `users.created_by_id`/`updated_by_id` (NOT NULL,
-    /// non-deferrable) or BookWyrm's `bookwyrm_status.reply_parent_id`
-    /// (nullable, deferrable), both self-referencing their own serial
-    /// `id`. Resolved by reserving `id` values from the sequence up front
-    /// via `nextval()` and writing them explicitly, the same way a
-    /// hand-written seed script would — see `insert_self_referencing_table`.
+    /// BookWyrm's `bookwyrm_status.reply_parent_id` (nullable, deferrable),
+    /// self-referencing its own serial `id`. Resolved by reserving `id`
+    /// values from the sequence up front via `nextval()` and writing them
+    /// explicitly, the same way a hand-written seed script would — see
+    /// `insert_self_referencing_table`. A table whose self-loop coexists
+    /// with genuine cross-table cyclic edges (Zammad's `users`, which also
+    /// has a hard incoming edge from `organizations`) takes the `Backfill`
+    /// path above instead, since ordering still matters for the
+    /// cross-table edges.
     SelfReferencing(TableId),
 }
 
@@ -150,31 +166,51 @@ pub fn plan_insertion(schema: &Schema) -> Result<InsertPlan> {
             }
         }
 
-        // A pure self-loop where every self-referencing column targets a
-        // sequence-backed server-assigned column (almost always its own
-        // PK) has a resolution strategy none of the branches below know
-        // about — reserving `id` values from the sequence before
-        // generating any row — so it's routed there regardless of
-        // deferrability or nullability, ahead of every other check.
-        if has_self_loop
-            && !internal.is_empty()
-            && internal.iter().all(|r| {
-                let ref_table = schema.table(&r.fk.ref_table).expect("table exists");
-                r.fk.ref_columns.iter().all(|c| {
+        // A self-loop edge (a table's FK column pointing back at its own
+        // row) whose referenced column is a sequence-backed server-assigned
+        // one (almost always its own PK) is always resolvable by reserving
+        // values from the sequence before generating any row, regardless
+        // of nullability or deferrability — see `insert_self_referencing_table`.
+        let is_seq_backed_self_loop = |r: &FkRef| {
+            r.table == r.fk.ref_table
+                && r.fk.ref_columns.iter().all(|c| {
+                    let ref_table = schema.table(&r.fk.ref_table).expect("table exists");
                     ref_table
                         .column(c)
                         .is_some_and(|col| col.is_sequence_backed())
                 })
-            })
-        {
+        };
+
+        // A pure self-loop (single table, every internal edge is a
+        // sequence-backed self-reference) takes the dedicated single-table
+        // strategy, ahead of every other check.
+        if has_self_loop && !internal.is_empty() && internal.iter().all(is_seq_backed_self_loop) {
             groups.push(InsertGroup::SelfReferencing(tables[0].clone()));
             continue;
         }
 
+        // Deferrability is checked against every internal edge, including
+        // any sequence-backed self-loop, before those self-loops are ever
+        // pulled out below — a self-loop coexisting with a genuinely
+        // deferrable cross-table edge has no real-world precedent yet, so
+        // it's left on the existing `Deferred` path unchanged rather than
+        // guessed at.
         if internal.iter().any(|r| r.fk.deferrable) {
             groups.push(InsertGroup::Deferred(tables));
             continue;
         }
+
+        // Pull sequence-backed self-loop edges out of the cycle-breaking
+        // classification entirely — they never need to be nulled-then-
+        // backfilled or to constrain the group's insertion order, since
+        // they're always resolvable per-table via up-front `nextval()`
+        // reservation (see `insert_backfill_group`). This is what lets a
+        // multi-table cycle like Zammad's `users` <-> `organizations`
+        // resolve: `users`' own self-referencing columns are set aside
+        // here, leaving only the genuine cross-table edges (one hard, one
+        // nullable) for the ordering/backfill logic below.
+        let (self_referencing, internal): (Vec<FkRef>, Vec<FkRef>) =
+            internal.into_iter().partition(is_seq_backed_self_loop);
 
         // Only one nullable edge is needed to break a cycle — leave that
         // edge NULL on first insert, insert everything else in the order
@@ -250,6 +286,7 @@ pub fn plan_insertion(schema: &Schema) -> Result<InsertPlan> {
         groups.push(InsertGroup::Backfill {
             tables: ordered_tables,
             null_then_backfill: breakable,
+            self_referencing,
         });
     }
 
@@ -463,9 +500,11 @@ mod tests {
             InsertGroup::Backfill {
                 tables,
                 null_then_backfill,
+                self_referencing,
             } => {
                 assert_eq!(tables, &[tid("employees")]);
                 assert_eq!(null_then_backfill.len(), 1);
+                assert!(self_referencing.is_empty());
             }
             other => panic!("expected Backfill group, got {other:?}"),
         }
@@ -530,12 +569,106 @@ mod tests {
             InsertGroup::Backfill {
                 tables,
                 null_then_backfill,
+                self_referencing,
             } => {
                 // `b` must come before `a`: `a`'s NOT NULL FK needs `b`'s
                 // row to already exist at insert time.
                 assert_eq!(tables, &[tid("b"), tid("a")]);
                 assert_eq!(null_then_backfill.len(), 1);
                 assert_eq!(null_then_backfill[0].fk.name, "b_a_id_fkey");
+                assert!(self_referencing.is_empty());
+            }
+            other => panic!("expected Backfill group, got {other:?}"),
+        }
+    }
+
+    /// Zammad's real shape: `users` has NOT NULL self-referencing
+    /// `created_by_id`/`updated_by_id` on its own sequence-backed `id`,
+    /// plus a nullable cross-table `organization_id` FK; `organizations`
+    /// has NOT NULL `created_by_id`/`updated_by_id` referencing `users`.
+    /// The self-loop edges must be pulled out into `self_referencing`
+    /// rather than making the whole group `UnsatisfiableCycle` — only the
+    /// genuine cross-table edges (one hard, one nullable) should drive
+    /// `tables`' order and `null_then_backfill`.
+    #[test]
+    fn multi_table_cycle_with_self_referencing_table_resolves_via_backfill() {
+        let mut users = table(
+            "users",
+            vec![
+                simple_column("id", false),
+                simple_column("created_by_id", false),
+                simple_column("updated_by_id", false),
+                simple_column("organization_id", true),
+            ],
+            vec![
+                fk(
+                    "users_created_by_id_fkey",
+                    &["created_by_id"],
+                    "users",
+                    &["id"],
+                    false,
+                ),
+                fk(
+                    "users_updated_by_id_fkey",
+                    &["updated_by_id"],
+                    "users",
+                    &["id"],
+                    false,
+                ),
+                fk(
+                    "users_organization_id_fkey",
+                    &["organization_id"],
+                    "organizations",
+                    &["id"],
+                    false,
+                ),
+            ],
+        );
+        users.columns[0].is_serial_default = true;
+        let organizations = table(
+            "organizations",
+            vec![
+                simple_column("id", false),
+                simple_column("created_by_id", false),
+                simple_column("updated_by_id", false),
+            ],
+            vec![
+                fk(
+                    "organizations_created_by_id_fkey",
+                    &["created_by_id"],
+                    "users",
+                    &["id"],
+                    false,
+                ),
+                fk(
+                    "organizations_updated_by_id_fkey",
+                    &["updated_by_id"],
+                    "users",
+                    &["id"],
+                    false,
+                ),
+            ],
+        );
+        let schema = Schema {
+            tables: vec![users, organizations],
+        };
+        let plan = plan_insertion(&schema).unwrap();
+        assert_eq!(plan.groups.len(), 1);
+        match &plan.groups[0] {
+            InsertGroup::Backfill {
+                tables,
+                null_then_backfill,
+                self_referencing,
+            } => {
+                // `users` must come before `organizations`: the latter's
+                // NOT NULL FKs need `users`' rows to already exist.
+                assert_eq!(tables, &[tid("users"), tid("organizations")]);
+                assert_eq!(null_then_backfill.len(), 1);
+                assert_eq!(null_then_backfill[0].fk.name, "users_organization_id_fkey");
+                assert_eq!(self_referencing.len(), 2);
+                assert!(self_referencing
+                    .iter()
+                    .all(|r| r.table == tid("users") && r.fk.ref_table == tid("users")));
             }
             other => panic!("expected Backfill group, got {other:?}"),
         }
