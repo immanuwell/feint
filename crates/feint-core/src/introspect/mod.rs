@@ -123,6 +123,18 @@ pub struct Column {
     /// satisfy `col IS NULL` in the first place, so the escape wouldn't
     /// be reachable).
     pub check_null_escape: bool,
+    /// The literal prefix narrowed from a simple single-column CHECK
+    /// constraint of the shape `CHECK (col LIKE 'prefix%')` — exactly one
+    /// trailing wildcard, nothing else (a `\%`/`\_`/`\\` inside the
+    /// literal portion is LIKE's standard backslash escape and is kept as
+    /// its literal character, not treated as a real wildcard). A common
+    /// idiom for a value with a mandatory scheme/marker, e.g. Twenty's
+    /// `secret`/`value`/`"encryptedValue"` columns (`CHECK (col LIKE
+    /// 'enc:v2:%')`) or Windmill's `username`/`"schedule-%"` prefix.
+    /// `None` when no such constraint exists, or when the pattern has a
+    /// wildcard anywhere but the very end (feint doesn't attempt anything
+    /// more general than a pure prefix match).
+    pub check_like_prefix: Option<String>,
     pub nullable: bool,
     pub identity: Identity,
     /// `GENERATED ALWAYS AS (...) STORED` — never written by feint.
@@ -293,6 +305,7 @@ pub async fn introspect(client: &Client, schemas: &[String]) -> Result<Schema> {
             }
             col.check_allowed_values = simple_allowed_values(&check_constraints, &col.name);
             col.check_null_escape = col.nullable && null_escapes.contains(&col.name);
+            col.check_like_prefix = simple_like_prefix(&check_constraints, &col.name);
         }
 
         tables.push(Table {
@@ -560,6 +573,7 @@ async fn list_columns(
             check_max: None,
             check_allowed_values: None,
             check_null_escape: false,
+            check_like_prefix: None,
             nullable: !not_null,
             identity,
             is_stored_generated,
@@ -938,6 +952,57 @@ fn null_escape_columns(check_constraints: &[CheckConstraint]) -> std::collection
     escapes
 }
 
+/// Matches `pg_get_constraintdef`'s `col LIKE 'pattern'` shape — Postgres
+/// prints `LIKE` as the `~~` operator. Column and pattern are captured
+/// separately; [`like_prefix`] then decides whether `pattern` is actually
+/// a pure literal-prefix-plus-trailing-wildcard shape.
+static SIMPLE_LIKE_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r#"^CHECK \(\(\(?\s*"?([A-Za-z_][A-Za-z0-9_]*)"?\s*\)?(?:::[\w". ]+)?\s*~~\s*'((?:[^']|'')*)'(?:::[\w". ]+)?\)\)$"#,
+    )
+    .expect("valid regex")
+});
+
+/// Extracts the literal prefix from a `LIKE` pattern of exactly the shape
+/// `<literal>%` — a single trailing wildcard, nothing else. Honors LIKE's
+/// standard backslash escape (`\%`, `\_`, `\\`) so an *escaped* wildcard
+/// inside the literal portion (e.g. Odoo's `'x\_%'`) is unescaped
+/// into its literal character rather than mistaken for a real wildcard.
+/// `None` for a wildcard (`%`/`_`) anywhere but the very end, or no
+/// trailing `%` at all — feint doesn't attempt anything more general than
+/// a pure prefix match.
+fn like_prefix(pattern: &str) -> Option<String> {
+    let mut prefix = String::new();
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => prefix.push(chars.next()?),
+            '%' => return chars.next().is_none().then_some(prefix),
+            '_' => return None,
+            _ => prefix.push(c),
+        }
+    }
+    None
+}
+
+/// The literal LIKE-prefix narrowed from every simple, single-column
+/// `col LIKE 'prefix%'` CHECK constraint on `table` that mentions
+/// `column_name` and whose pattern is a pure prefix match (see
+/// [`like_prefix`]). Multiple matching constraints on the same column
+/// take the first one found — genuinely rare in practice, and unlike
+/// `check_min`/`check_max`'s numeric bounds or `check_allowed_values`'s
+/// discrete set, two different literal prefixes don't have a
+/// well-defined intersection to compute.
+fn simple_like_prefix(check_constraints: &[CheckConstraint], column_name: &str) -> Option<String> {
+    check_constraints.iter().find_map(|c| {
+        let caps = SIMPLE_LIKE_RE.captures(c.definition.trim())?;
+        if &caps[1] != column_name {
+            return None;
+        }
+        like_prefix(&caps[2].replace("''", "'"))
+    })
+}
+
 async fn list_check_constraints(client: &Client, table_oid: u32) -> Result<Vec<CheckConstraint>> {
     let rows = client
         .query(
@@ -1198,5 +1263,71 @@ mod tests {
     fn no_null_alternative_returns_empty() {
         let constraints = vec![check("simple", "CHECK ((price >= (0)::numeric))")];
         assert!(null_escape_columns(&constraints).is_empty());
+    }
+
+    #[test]
+    fn like_prefix_extracts_a_pure_trailing_wildcard_pattern() {
+        assert_eq!(like_prefix("enc:v2:%"), Some("enc:v2:".to_string()));
+        assert_eq!(like_prefix("schedule-%"), Some("schedule-".to_string()));
+    }
+
+    #[test]
+    fn like_prefix_unescapes_a_literal_wildcard_inside_the_prefix() {
+        // Odoo's real shape: an escaped underscore inside the literal
+        // portion, not a real single-char wildcard.
+        assert_eq!(like_prefix(r"x\_%"), Some("x_".to_string()));
+    }
+
+    #[test]
+    fn like_prefix_rejects_a_wildcard_before_the_end() {
+        assert_eq!(like_prefix("%enc:v2:"), None);
+        assert_eq!(like_prefix("enc:%:v2"), None);
+        assert_eq!(like_prefix("enc:_2:%"), None);
+    }
+
+    #[test]
+    fn like_prefix_rejects_no_trailing_wildcard_at_all() {
+        assert_eq!(like_prefix("exact-value"), None);
+    }
+
+    #[test]
+    fn simple_like_prefix_matches_the_real_twenty_shape() {
+        let constraints = vec![check(
+            "encryptedValue_check",
+            "CHECK ((\"encryptedValue\" ~~ 'enc:v2:%'::text))",
+        )];
+        assert_eq!(
+            simple_like_prefix(&constraints, "encryptedValue"),
+            Some("enc:v2:".to_string())
+        );
+    }
+
+    #[test]
+    fn simple_like_prefix_matches_the_real_windmill_shape_with_a_column_cast() {
+        let constraints = vec![check(
+            "username_check",
+            "CHECK (((username)::text ~~ 'schedule-%'::text))",
+        )];
+        assert_eq!(
+            simple_like_prefix(&constraints, "username"),
+            Some("schedule-".to_string())
+        );
+    }
+
+    #[test]
+    fn simple_like_prefix_does_not_match_a_compound_or_expression() {
+        // Odoo's real shape, structurally: a LIKE alternative combined
+        // with an unrelated comparison — not a bare `col LIKE 'prefix%'`.
+        let constraints = vec![check(
+            "state_name_check",
+            "CHECK ((((state)::text <> 'manual'::text) OR ((name)::text ~~ 'x\\_%'::text)))",
+        )];
+        assert_eq!(simple_like_prefix(&constraints, "name"), None);
+    }
+
+    #[test]
+    fn simple_like_prefix_wrong_column_name_is_ignored() {
+        let constraints = vec![check("c", "CHECK ((secret ~~ 'enc:v2:%'::text))")];
+        assert_eq!(simple_like_prefix(&constraints, "value"), None);
     }
 }

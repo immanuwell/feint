@@ -411,6 +411,7 @@ mod tests {
                 check_max: None,
                 check_allowed_values: None,
                 check_null_escape: false,
+                check_like_prefix: None,
                 nullable: false,
                 identity: Identity::None,
                 is_stored_generated: false,

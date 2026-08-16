@@ -66,6 +66,15 @@ pub fn generate_value(
             return Ok(truncate_to_column_length(value, column));
         }
     }
+    // A `col LIKE 'prefix%'` CHECK constraint is likewise a hard
+    // constraint — the generated value must literally start with
+    // `prefix`, so it's resolved before any name-heuristic/type-fallback
+    // generator has a chance to produce something that doesn't.
+    if override_generator.is_none() {
+        if let Some(value) = like_prefix_value(column, rng) {
+            return Ok(truncate_to_column_length(value, column));
+        }
+    }
     let heuristic_name = name_heuristic(&column.name).filter(|_| is_text_like(column));
     let value = if let Some(name) = override_generator {
         dispatch_named(name, column, rng)?
@@ -129,6 +138,26 @@ fn allowed_value(column: &Column, rng: &mut ChaCha8Rng) -> Option<PgValue> {
         return Some(PgValue::Text(allowed[idx].clone()));
     }
     None
+}
+
+/// Builds a value starting with `column.check_like_prefix`'s literal
+/// prefix, followed by a short random alphanumeric suffix — the suffix is
+/// never required by the CHECK itself (a `LIKE 'prefix%'` pattern matches
+/// the bare prefix too, an empty match for `%`), but including one avoids
+/// generating the exact same literal value for every row, which would
+/// otherwise doom any row-generation retry against a UNIQUE constraint on
+/// this column to fail identically every attempt.
+fn like_prefix_value(column: &Column, rng: &mut ChaCha8Rng) -> Option<PgValue> {
+    let prefix = column.check_like_prefix.as_ref()?;
+    if !is_text_like(column) {
+        return None;
+    }
+    let suffix: String = rng
+        .sample_iter(rand::distributions::Alphanumeric)
+        .take(6)
+        .map(char::from)
+        .collect();
+    Some(PgValue::Text(format!("{prefix}{suffix}")))
 }
 
 /// `varchar(N)`/`bpchar(N)` columns reject a value longer than `N`
@@ -352,6 +381,7 @@ fn placeholder_column(type_name: &str, nullable: bool) -> Column {
         check_max: None,
         check_allowed_values: None,
         check_null_escape: false,
+        check_like_prefix: None,
         nullable,
         identity: crate::introspect::Identity::None,
         is_stored_generated: false,
@@ -670,6 +700,7 @@ mod tests {
             check_max: None,
             check_allowed_values: None,
             check_null_escape: false,
+            check_like_prefix: None,
             nullable: false,
             identity: Identity::None,
             is_stored_generated: false,
@@ -853,6 +884,78 @@ mod tests {
         );
         let v = generate_value(&col, Some("first_name"), &mut rng).unwrap();
         assert_ne!(v, PgValue::Null);
+    }
+
+    #[test]
+    fn check_like_prefix_generates_a_value_starting_with_the_prefix() {
+        let col = Column {
+            check_like_prefix: Some("enc:v2:".to_string()),
+            ..text_column("encryptedValue")
+        };
+        let mut rng = derive_rng(
+            "seed",
+            &SeedKey {
+                table: "credentials",
+                column: "encryptedValue",
+                row_identity: "0",
+            },
+        );
+        let v = generate_value(&col, None, &mut rng).unwrap();
+        match v {
+            PgValue::Text(s) => assert!(
+                s.starts_with("enc:v2:"),
+                "expected a value starting with `enc:v2:`, got {s:?}"
+            ),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_like_prefix_varies_the_suffix_across_rows() {
+        let col = Column {
+            check_like_prefix: Some("enc:v2:".to_string()),
+            ..text_column("encryptedValue")
+        };
+        let mut rng0 = derive_rng(
+            "seed",
+            &SeedKey {
+                table: "credentials",
+                column: "encryptedValue",
+                row_identity: "0",
+            },
+        );
+        let mut rng1 = derive_rng(
+            "seed",
+            &SeedKey {
+                table: "credentials",
+                column: "encryptedValue",
+                row_identity: "1",
+            },
+        );
+        let v0 = generate_value(&col, None, &mut rng0).unwrap();
+        let v1 = generate_value(&col, None, &mut rng1).unwrap();
+        assert_ne!(v0, v1);
+    }
+
+    #[test]
+    fn explicit_override_generator_bypasses_check_like_prefix() {
+        let col = Column {
+            check_like_prefix: Some("enc:v2:".to_string()),
+            ..text_column("encryptedValue")
+        };
+        let mut rng = derive_rng(
+            "seed",
+            &SeedKey {
+                table: "credentials",
+                column: "encryptedValue",
+                row_identity: "0",
+            },
+        );
+        let v = generate_value(&col, Some("first_name"), &mut rng).unwrap();
+        match v {
+            PgValue::Text(s) => assert!(!s.starts_with("enc:v2:")),
+            other => panic!("expected Text, got {other:?}"),
+        }
     }
 
     #[test]

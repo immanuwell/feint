@@ -40,6 +40,7 @@ use rstest::rstest;
     "enum_type_outside_search_path",
     include_str!("fixtures/schemas/enum_type_outside_search_path.sql")
 )]
+#[case::check_like_prefix("check_like_prefix", include_str!("fixtures/schemas/check_like_prefix.sql"))]
 #[tokio::test]
 async fn nasty_schema_generates_cleanly(#[case] name: &str, #[case] ddl: &str) {
     let mut db = TestDb::setup(name, ddl).await;
