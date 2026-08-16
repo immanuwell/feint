@@ -235,6 +235,56 @@ const FIXTURES: &[Fixture] = &[
         sql: include_str!("fixtures/real_world_schemas/zammad.sql"),
         schema: "public",
     },
+    Fixture {
+        name: "docmost",
+        sql: include_str!("fixtures/real_world_schemas/docmost.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "nocodb",
+        sql: include_str!("fixtures/real_world_schemas/nocodb.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "lemmy",
+        sql: include_str!("fixtures/real_world_schemas/lemmy.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "wger",
+        sql: include_str!("fixtures/real_world_schemas/wger.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "gitlab",
+        sql: include_str!("fixtures/real_world_schemas/gitlab.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "rallly",
+        sql: include_str!("fixtures/real_world_schemas/rallly.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "sentry",
+        sql: include_str!("fixtures/real_world_schemas/sentry.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "mobilizon",
+        sql: include_str!("fixtures/real_world_schemas/mobilizon.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "chirpstack",
+        sql: include_str!("fixtures/real_world_schemas/chirpstack.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "plane",
+        sql: include_str!("fixtures/real_world_schemas/plane.sql"),
+        schema: "public",
+    },
 ];
 
 /// Per-fixture, per-phase outcome. `Ok(detail)` for a human-readable
@@ -329,6 +379,28 @@ async fn real_world_schemas_survive_feints_full_command_surface() {
     .with_env_var("POSTGRES_USER", "postgres")
     .with_env_var("POSTGRES_PASSWORD", "postgres")
     .with_env_var("POSTGRES_DB", "postgres")
+    // GitLab's structure.sql alone declares enough objects that Postgres's
+    // default `max_locks_per_transaction` (64) runs out mid-load ("out of
+    // shared memory") — and since every fixture shares this one container,
+    // a lock-table exhaustion on one fixture's `apply schema` step was
+    // observed to break the *next* fixture's unrelated DROP/CREATE DATABASE
+    // too. Bumped well above what any single fixture in this pilot needs.
+    //
+    // `with_cmd` replaces this image's own default command outright rather
+    // than appending, so the original `-c config_file=...` (this image's
+    // own postgresql.conf, which is what actually sets
+    // `shared_preload_libraries` for vchord/pgvector — Immich's fixture
+    // needs those preloaded, and the default `postgres` binary invocation
+    // with no config_file does not have them) has to be repeated here
+    // alongside the new flag, or Immich's `apply schema` step starts
+    // failing with "vchord must be loaded".
+    .with_cmd([
+        "postgres",
+        "-c",
+        "config_file=/etc/postgresql/postgresql.conf",
+        "-c",
+        "max_locks_per_transaction=512",
+    ])
     .start()
     .await
     .expect("start postgres testcontainer (is Docker running?)");
