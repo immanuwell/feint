@@ -551,13 +551,20 @@ fn bounded_range(
 fn random_numeric(rng: &mut ChaCha8Rng, precision: Option<i32>, scale: Option<i32>) -> Decimal {
     if let (Some(precision), Some(scale)) = (precision, scale) {
         if precision > 0 && scale >= 0 && precision >= scale {
-            // Cap the digits actually used so the mantissa always fits an
-            // `i64` (`Decimal::new` takes one): real-world numeric(p,s)
-            // columns (money, coordinates, exchange rates, ...) don't need
-            // more than this to exercise generation correctly.
-            let scale = (scale as u32).min(12);
-            let integer_digits =
-                ((precision - scale as i32).max(0) as u32).min(18u32.saturating_sub(scale));
+            // Cap the decimal digits actually output so the mantissa always
+            // fits an `i64` (`Decimal::new` takes one): real-world
+            // numeric(p,s) columns (money, coordinates, exchange rates, ...)
+            // don't need more than this to exercise generation correctly.
+            // Outputting fewer decimal digits than `scale` allows is legal
+            // (numeric(p,s) permits *up to* s), but the integer-digit budget
+            // must still come from the column's *real* scale (Moodle's
+            // numeric(15,14) allows only 1 integer digit — 15-14 — not
+            // 15-12; using the clamped scale here previously overshot the
+            // column's actual precision and Postgres rejected the row).
+            let scale_clamped = (scale as u32).min(12);
+            let true_integer_digits = (precision - scale).max(0) as u32;
+            let integer_digits = true_integer_digits.min(18u32.saturating_sub(scale_clamped));
+            let scale = scale_clamped;
             let max_integer = 10i64.pow(integer_digits) - 1;
             let integer_part = if max_integer > 0 {
                 rng.gen_range(0..=max_integer)
