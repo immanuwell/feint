@@ -14,6 +14,7 @@ fn config_with_strategy(table: &str, rows: u32, strategy: TableStrategy) -> Fein
             rows,
             strategy,
             columns: Default::default(),
+            logical_foreign_keys: Default::default(),
         },
     );
     FeintConfig {

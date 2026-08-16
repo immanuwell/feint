@@ -225,6 +225,7 @@ pub fn apply_policy(
                         rows: DEFAULT_ROWS,
                         strategy: Default::default(),
                         columns: Default::default(),
+                        logical_foreign_keys: Default::default(),
                     });
             let has_existing_mask = table_entry
                 .columns
@@ -398,6 +399,7 @@ mod tests {
                         json_paths: Default::default(),
                     },
                 )]),
+                logical_foreign_keys: Default::default(),
             },
         );
 

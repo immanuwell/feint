@@ -355,6 +355,7 @@ mod tests {
                             json_paths: Default::default(),
                         },
                     )]),
+                    logical_foreign_keys: Default::default(),
                 },
             );
             ClassificationLock::from_report(&classify_schema(&schema, &hashed_config))
@@ -375,6 +376,7 @@ mod tests {
                         json_paths: Default::default(),
                     },
                 )]),
+                logical_foreign_keys: Default::default(),
             },
         );
         let report = classify_schema(&schema, &config);

@@ -25,6 +25,7 @@ fn config_with_rows(table: &str, rows: u32) -> FeintConfig {
             rows,
             strategy: Default::default(),
             columns: Default::default(),
+            logical_foreign_keys: Default::default(),
         },
     );
     FeintConfig {

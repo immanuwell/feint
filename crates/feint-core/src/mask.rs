@@ -715,6 +715,7 @@ mod tests {
                         )]),
                     },
                 )]),
+                logical_foreign_keys: Default::default(),
             },
         );
         let err = validate_masking_config(&schema, &config).unwrap_err();
@@ -744,6 +745,7 @@ mod tests {
                         json_paths: JsonPathRules::from([("a".to_string(), MaskStrategy::Redact)]),
                     },
                 )]),
+                logical_foreign_keys: Default::default(),
             },
         );
         let err = validate_masking_config(&schema, &config).unwrap_err();

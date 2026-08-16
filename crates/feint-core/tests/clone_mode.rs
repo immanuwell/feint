@@ -33,6 +33,7 @@ fn config_with(table: &str, columns: Vec<(&str, MaskStrategy)>) -> FeintConfig {
             rows: 0,
             strategy: Default::default(),
             columns: cols,
+            logical_foreign_keys: Default::default(),
         },
     );
     FeintConfig {

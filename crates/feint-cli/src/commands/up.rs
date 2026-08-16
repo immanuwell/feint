@@ -25,8 +25,10 @@ pub async fn run(
     let mut client = feint_core::connect::connect(database_url).await?;
 
     let spinner = ui::spinner("Inspecting schema...");
-    let schema = introspect::introspect(&client, schemas).await?;
+    let mut schema = introspect::introspect(&client, schemas).await?;
     spinner.finish_and_clear();
+
+    feint_core::config::apply_logical_foreign_keys(&mut schema, &config)?;
 
     let plan = graph::plan_insertion(&schema)?;
 

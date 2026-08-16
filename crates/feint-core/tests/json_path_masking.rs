@@ -24,6 +24,7 @@ fn config_with_json_paths(table: &str, column: &str, paths: JsonPathRules) -> Fe
             rows: 0,
             strategy: Default::default(),
             columns: cols,
+            logical_foreign_keys: Default::default(),
         },
     );
     FeintConfig {
@@ -159,6 +160,7 @@ async fn json_paths_and_whole_column_mask_together_is_rejected() {
             rows: 0,
             strategy: Default::default(),
             columns: cols,
+            logical_foreign_keys: Default::default(),
         },
     );
     let config = FeintConfig {

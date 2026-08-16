@@ -87,6 +87,7 @@ pub fn migrate_neosync(job_json: &str) -> Result<NeosyncMigration, serde_json::E
                 rows: DEFAULT_ROWS,
                 strategy: Default::default(),
                 columns: BTreeMap::new(),
+                logical_foreign_keys: Vec::new(),
             });
 
         let Some(config_key) = mapping

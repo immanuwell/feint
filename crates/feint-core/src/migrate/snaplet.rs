@@ -53,6 +53,7 @@ pub fn migrate_snaplet(config_ts_source: &str, seed_ts_source: Option<&str>) -> 
                         rows: DEFAULT_ROWS,
                         strategy: Default::default(),
                         columns: BTreeMap::new(),
+                        logical_foreign_keys: Vec::new(),
                     });
             }
             SelectEntry::Include(name) => {

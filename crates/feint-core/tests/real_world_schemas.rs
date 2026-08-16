@@ -440,6 +440,7 @@ fn config_with_rows(schema_name: &str, tables: &[String], rows: u32) -> FeintCon
                 rows,
                 strategy: Default::default(),
                 columns: Default::default(),
+                logical_foreign_keys: Default::default(),
             },
         );
     }
@@ -448,6 +449,77 @@ fn config_with_rows(schema_name: &str, tables: &[String], rows: u32) -> FeintCon
         seed: "real-world".to_string(),
         tables: cfg_tables,
     }
+}
+
+/// The uniform `rows: N` baseline, plus fixture-specific overrides for two
+/// of the three "trigger-based relationships" findings (STATUS.md) that
+/// this can currently demonstrate a fix for — the third, Cal.com, needs
+/// literal string values embedded in a trigger body, which is unsafe to
+/// infer and stays a documented, unfixed limitation (see STATUS.md):
+///
+/// - **Chatwoot**: no PostgreSQL FK from `conversations.account_id` or
+///   `campaigns.account_id` to `accounts.id` at all, but an app-level
+///   trigger pair on each depends on it regardless (see
+///   `logical_foreign_keys.rs`'s doc comment for the full shape —
+///   `conversations`' version is the one reproduced there) —
+///   `logical_foreign_keys:` fixes it.
+/// - **Lemmy**: `comment_aggregates`, `community_aggregates`,
+///   `person_aggregates`, and `post_aggregates` are each populated
+///   entirely by a real Postgres `AFTER INSERT` trigger on their base
+///   table; feint's own independent generation for them collides with the
+///   row the trigger already created. `site_aggregates` is the same shape
+///   plus `CREATE UNIQUE INDEX idx_site_aggregates_1_row_only ON
+///   site_aggregates USING btree ((true))` — the app's real invariant is
+///   exactly one `site` row ever, so `site` itself also needs `rows: 1`,
+///   or its own second/third generated row would trip that index via the
+///   trigger regardless of what feint does with `site_aggregates`
+///   directly. All five are already-existing, ordinary config (`rows: 0`/
+///   `rows: 1`), no new mechanism needed — they just stop feint from
+///   generating into (or over-generating into) a trigger-owned table.
+///
+/// Every other fixture is untouched; this only ever adds to the uniform
+/// baseline `config_with_rows` already builds.
+fn config_with_rows_and_overrides(
+    fixture_name: &str,
+    schema_name: &str,
+    tables: &[String],
+    rows: u32,
+) -> FeintConfig {
+    let mut config = config_with_rows(schema_name, tables, rows);
+    match fixture_name {
+        "chatwoot" => {
+            for table in ["conversations", "campaigns"] {
+                if let Some(t) = config.tables.get_mut(&format!("{schema_name}.{table}")) {
+                    t.logical_foreign_keys
+                        .push(feint_core::config::LogicalForeignKey {
+                            columns: vec!["account_id".to_string()],
+                            ref_table: format!("{schema_name}.accounts"),
+                            ref_columns: vec!["id".to_string()],
+                        });
+                }
+            }
+        }
+        "lemmy" => {
+            for table in [
+                "comment_aggregates",
+                "community_aggregates",
+                "person_aggregates",
+                "post_aggregates",
+                "site_aggregates",
+            ] {
+                if let Some(t) = config.tables.get_mut(&format!("{schema_name}.{table}")) {
+                    t.rows = 0;
+                }
+            }
+            for table in ["site", "local_site", "local_site_rate_limit"] {
+                if let Some(t) = config.tables.get_mut(&format!("{schema_name}.{table}")) {
+                    t.rows = 1;
+                }
+            }
+        }
+        _ => {}
+    }
+    config
 }
 
 #[tokio::test]
@@ -556,7 +628,7 @@ async fn real_world_schemas_survive_feints_full_command_surface() {
             .await
             .expect("apply schema dump to clone target");
 
-        let schema = match introspect(
+        let mut schema = match introspect(
             &source_client,
             std::slice::from_ref(&fixture.schema.to_string()),
         )
@@ -577,6 +649,26 @@ async fn real_world_schemas_survive_feints_full_command_surface() {
             }
         };
 
+        let table_names: Vec<String> = schema.tables.iter().map(|t| t.id.name.clone()).collect();
+        let generate_config =
+            config_with_rows_and_overrides(fixture.name, fixture.schema, &table_names, 3);
+
+        // A handful of real fixtures need a `logical_foreign_keys`
+        // declaration to demonstrate a fix that's inherently config-driven
+        // (not purely a `src/` behavior change) — see
+        // `config_with_rows_and_overrides`. Merging must happen before
+        // `plan_insertion` runs, since a logical FK can change dependency
+        // ordering exactly like a real one would.
+        if let Err(e) =
+            feint_core::config::apply_logical_foreign_keys(&mut schema, &generate_config)
+        {
+            let msg = format!("{e}");
+            println!("  ✗ apply_logical_foreign_keys: {msg}");
+            report.plan = Some(Err(msg));
+            reports.push((fixture.name, report));
+            continue;
+        }
+
         let plan = match plan_insertion(&schema) {
             Ok(p) => {
                 let detail = format!("{} groups", p.groups.len());
@@ -592,9 +684,6 @@ async fn real_world_schemas_survive_feints_full_command_surface() {
                 continue;
             }
         };
-
-        let table_names: Vec<String> = schema.tables.iter().map(|t| t.id.name.clone()).collect();
-        let generate_config = config_with_rows(fixture.schema, &table_names, 3);
 
         // `classify` is pure introspection — no live data needed, so it
         // runs against the schema exactly as `feint classify` would

@@ -10,12 +10,15 @@ pub async fn run(database_url: &str, config_path: &Path, schemas: &[String]) -> 
     let spinner = ui::spinner("Analyzing database...");
     let client = feint_core::connect::connect(database_url).await?;
 
-    let schema = introspect::introspect(&client, schemas).await?;
+    let mut schema = introspect::introspect(&client, schemas).await?;
     spinner.finish_and_clear();
 
     // A feint.yaml may not exist yet — `plan` is useful both before and
     // after `init`, falling back to default row counts when there's none.
     let config = FeintConfig::load(config_path).ok();
+    if let Some(c) = &config {
+        feint_core::config::apply_logical_foreign_keys(&mut schema, c)?;
+    }
 
     println!();
     for root in graph::dependency_tree(&schema) {

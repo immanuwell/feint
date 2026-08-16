@@ -142,6 +142,7 @@ async fn an_explicit_mask_none_override_on_a_sensitive_column_is_visible_in_the_
                     json_paths: Default::default(),
                 },
             )]),
+            logical_foreign_keys: Default::default(),
         },
     );
     let config = FeintConfig {
@@ -188,6 +189,7 @@ async fn weakening_a_masked_column_to_none_is_caught_as_changed_drift() {
                         json_paths: Default::default(),
                     },
                 )]),
+                logical_foreign_keys: Default::default(),
             },
         )]),
     };
@@ -209,6 +211,7 @@ async fn weakening_a_masked_column_to_none_is_caught_as_changed_drift() {
                         json_paths: Default::default(),
                     },
                 )]),
+                logical_foreign_keys: Default::default(),
             },
         )]),
     };

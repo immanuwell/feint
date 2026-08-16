@@ -34,6 +34,7 @@ fn config_with_unmasked_name(table: &str) -> FeintConfig {
             rows: 0,
             strategy: Default::default(),
             columns: cols,
+            logical_foreign_keys: Default::default(),
         },
     );
     FeintConfig {

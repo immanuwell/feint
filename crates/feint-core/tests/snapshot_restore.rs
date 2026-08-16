@@ -200,6 +200,7 @@ async fn generate_strategy_table_is_rejected_at_capture_time() {
             rows: 10,
             strategy: TableStrategy::Generate,
             columns: Default::default(),
+            logical_foreign_keys: Default::default(),
         },
     );
     let config = FeintConfig {

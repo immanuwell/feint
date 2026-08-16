@@ -606,6 +606,26 @@ If a foreign key spans more than one column, feint samples a full matching row f
 
 If a table has a `UNIQUE` constraint (single-column or composite, including a bare `CREATE UNIQUE INDEX` with no backing constraint) over one or more foreign key columns, feint retries a colliding row with a different sampled value instead of letting Postgres reject it on a duplicate-key error. If the referenced table doesn't have enough distinct rows to fill the constraint without a collision, `up` fails with a clear error telling you to increase `rows:` on the referenced table.
 
+### Logical foreign keys
+
+Some schemas have a relationship that isn't a real PostgreSQL foreign key at all, but application code (usually a trigger) still depends on it. A common shape: table B has a column that names table A's row, but no `REFERENCES` constraint was ever declared, and a trigger on table B fails unless that column actually points at a real row in table A.
+
+Declare the relationship by hand under a table's `logical_foreign_keys:` key:
+
+```yaml
+version: 1
+seed: default
+tables:
+  public.conversations:
+    rows: 100
+    logical_foreign_keys:
+      - columns: [account_id]
+        ref_table: public.accounts
+        ref_columns: [id]
+```
+
+feint merges this into the schema's real foreign keys before planning insertion order, so the column gets sampled from `accounts.id` exactly like a declared FK would, instead of being generated independently. `ref_table` is `schema.table`, same format as a `feint.yaml` table key. There is no way to infer this automatically. You have to know the real relationship and declare it yourself.
+
 ### Self references and cycles
 
 Some schemas have a table that references itself, like an `employees` table with a `manager_id` column pointing back at `employees.id`. Some schemas have two or more tables that reference each other in a loop.
