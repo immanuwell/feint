@@ -330,6 +330,56 @@ const FIXTURES: &[Fixture] = &[
         sql: include_str!("fixtures/real_world_schemas/automatisch.sql"),
         schema: "public",
     },
+    Fixture {
+        name: "saleor",
+        sql: include_str!("fixtures/real_world_schemas/saleor.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "nodebb",
+        sql: include_str!("fixtures/real_world_schemas/nodebb.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "moodle",
+        sql: include_str!("fixtures/real_world_schemas/moodle.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "wikijs",
+        sql: include_str!("fixtures/real_world_schemas/wikijs.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "limesurvey",
+        sql: include_str!("fixtures/real_world_schemas/limesurvey.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "matrix_synapse",
+        sql: include_str!("fixtures/real_world_schemas/matrix_synapse.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "unleash",
+        sql: include_str!("fixtures/real_world_schemas/unleash.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "drone",
+        sql: include_str!("fixtures/real_world_schemas/drone.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "fider",
+        sql: include_str!("fixtures/real_world_schemas/fider.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "kong",
+        sql: include_str!("fixtures/real_world_schemas/kong.sql"),
+        schema: "public",
+    },
 ];
 
 /// Per-fixture, per-phase outcome. `Ok(detail)` for a human-readable
