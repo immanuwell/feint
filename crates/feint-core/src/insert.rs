@@ -640,10 +640,22 @@ fn generate_unique_row(
     )))
 }
 
+/// Schema-qualified so a type outside the connection's `search_path`
+/// still resolves — a bare `::"type_name"` cast only works when the
+/// type's own schema happens to already be on `search_path` (true for
+/// every built-in type, which lives in `pg_catalog`, but not guaranteed
+/// for a real schema's own `CREATE TYPE`/`CREATE DOMAIN`, e.g. Twenty's
+/// tables live in `core` and declare enums like `core.file_status_enum`
+/// there too — an unqualified `::file_status_enum` cast fails with "type
+/// does not exist" unless `core` happens to already be on `search_path`).
 pub(crate) fn sql_cast_type(column: &Column) -> String {
     match &column.type_kind {
-        crate::introspect::TypeKind::Array { elem_type, .. } => format!("\"{elem_type}\"[]"),
-        _ => format!("\"{}\"", column.type_name),
+        crate::introspect::TypeKind::Array {
+            elem_type,
+            elem_type_schema,
+            ..
+        } => format!("\"{elem_type_schema}\".\"{elem_type}\"[]"),
+        _ => format!("\"{}\".\"{}\"", column.type_schema, column.type_name),
     }
 }
 
@@ -1989,4 +2001,66 @@ pub(crate) async fn insert_deferred_group(
     .await?;
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::introspect::{Identity, TypeKind};
+
+    fn column(type_name: &str, type_schema: &str, type_kind: TypeKind) -> Column {
+        Column {
+            name: "col".to_string(),
+            position: 1,
+            type_name: type_name.to_string(),
+            type_schema: type_schema.to_string(),
+            type_kind,
+            max_length: None,
+            vector_dimensions: None,
+            numeric_precision: None,
+            numeric_scale: None,
+            check_min: None,
+            check_max: None,
+            check_allowed_values: None,
+            check_null_escape: false,
+            nullable: true,
+            identity: Identity::None,
+            is_stored_generated: false,
+            has_default: false,
+            is_serial_default: false,
+        }
+    }
+
+    #[test]
+    fn scalar_cast_is_schema_qualified() {
+        let col = column("int4", "pg_catalog", TypeKind::Scalar);
+        assert_eq!(sql_cast_type(&col), "\"pg_catalog\".\"int4\"");
+    }
+
+    #[test]
+    fn enum_cast_uses_the_type_s_own_schema_not_public() {
+        // Twenty's real shape: a table in schema `core` with an enum type
+        // also declared in `core`, not `public` — a bare `::file_status_enum`
+        // cast only resolves if `core` happens to be on `search_path`.
+        let col = column(
+            "file_status_enum",
+            "core",
+            TypeKind::Enum(vec!["UPLOADED".to_string(), "PENDING".to_string()]),
+        );
+        assert_eq!(sql_cast_type(&col), "\"core\".\"file_status_enum\"");
+    }
+
+    #[test]
+    fn array_cast_qualifies_the_element_type_s_schema() {
+        let col = column(
+            "_file_status_enum",
+            "core",
+            TypeKind::Array {
+                elem_type: "file_status_enum".to_string(),
+                elem_type_schema: "core".to_string(),
+                elem_kind: Box::new(TypeKind::Enum(vec!["UPLOADED".to_string()])),
+            },
+        );
+        assert_eq!(sql_cast_type(&col), "\"core\".\"file_status_enum\"[]");
+    }
 }

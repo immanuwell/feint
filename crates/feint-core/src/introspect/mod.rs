@@ -50,6 +50,10 @@ pub enum TypeKind {
     },
     Array {
         elem_type: String,
+        /// The schema `elem_type` itself lives in — see `Column::type_schema`
+        /// for why this matters (an array of a non-`public`-schema enum
+        /// needs its `::type_name[]` cast qualified too).
+        elem_type_schema: String,
         elem_kind: Box<TypeKind>,
     },
     Composite,
@@ -61,6 +65,17 @@ pub struct Column {
     pub name: String,
     pub position: i16,
     pub type_name: String,
+    /// The schema `type_name` itself lives in (`pg_catalog` for every
+    /// built-in scalar type, otherwise wherever a `CREATE TYPE`/`CREATE
+    /// DOMAIN` put it). Needed to build a correctly schema-qualified
+    /// `$N::"schema"."type_name"` cast for INSERT/UPDATE placeholders —
+    /// a bare `::"type_name"` only resolves for a type that happens to be
+    /// on the connection's `search_path`, which a real schema's own
+    /// custom enum/domain/composite type often isn't unqualified (Twenty's
+    /// `core.file_status_enum`, referenced from a plain, unqualified
+    /// `::file_status_enum` cast, fails with "type does not exist" unless
+    /// `core` happens to already be on `search_path`).
+    pub type_schema: String,
     pub type_kind: TypeKind,
     /// `character_maximum_length` for `varchar(N)`/`char(N)`/`bpchar(N)` —
     /// `None` for unbounded `text`/`citext` and every other type. Generators
@@ -166,6 +181,7 @@ fn has_binary_decoder(type_name: &str, type_kind: &TypeKind) -> bool {
         TypeKind::Array {
             elem_type,
             elem_kind,
+            ..
         } => has_binary_decoder(elem_type, elem_kind),
         TypeKind::Scalar => matches!(
             type_name,
@@ -389,8 +405,10 @@ async fn list_columns(
         .query(
             "SELECT a.attnum, a.attname, a.attnotnull, a.attidentity, a.attgenerated, \
                     t.oid, t.typname, t.typtype, t.typcategory, t.typbasetype, \
+                    tn.nspname AS type_schema, \
                     bt.typname AS base_typname, \
                     et.oid AS elem_type_oid, et.typname AS elem_typname, \
+                    etn.nspname AS elem_type_schema, \
                     et.typtype AS elem_typtype, et.typbasetype AS elem_base_type_oid, \
                     ebt.typname AS elem_base_typname, \
                     (SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d \
@@ -398,8 +416,10 @@ async fn list_columns(
                     a.atttypmod \
              FROM pg_attribute a \
              JOIN pg_type t ON t.oid = a.atttypid \
+             JOIN pg_namespace tn ON tn.oid = t.typnamespace \
              LEFT JOIN pg_type bt ON bt.oid = t.typbasetype \
              LEFT JOIN pg_type et ON et.oid = t.typelem AND t.typcategory = 'A' \
+             LEFT JOIN pg_namespace etn ON etn.oid = et.typnamespace \
              LEFT JOIN pg_type ebt ON ebt.oid = et.typbasetype \
              WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped \
              ORDER BY a.attnum",
@@ -419,14 +439,16 @@ async fn list_columns(
         let type_type: i8 = row.get(7);
         let type_category: i8 = row.get(8);
         let base_type_oid: u32 = row.get(9);
-        let base_typname: Option<String> = row.get(10);
-        let elem_type_oid: Option<u32> = row.get(11);
-        let elem_typname: Option<String> = row.get(12);
-        let elem_typtype: Option<i8> = row.get(13);
-        let elem_base_type_oid: Option<u32> = row.get(14);
-        let elem_base_typname: Option<String> = row.get(15);
-        let default_expr: Option<String> = row.get(16);
-        let typmod: i32 = row.get(17);
+        let type_schema: String = row.get(10);
+        let base_typname: Option<String> = row.get(11);
+        let elem_type_oid: Option<u32> = row.get(12);
+        let elem_typname: Option<String> = row.get(13);
+        let elem_type_schema: Option<String> = row.get(14);
+        let elem_typtype: Option<i8> = row.get(15);
+        let elem_base_type_oid: Option<u32> = row.get(16);
+        let elem_base_typname: Option<String> = row.get(17);
+        let default_expr: Option<String> = row.get(18);
+        let typmod: i32 = row.get(19);
         // `atttypmod` for varchar(N)/bpchar(N) is N + 4 (VARHDRSZ); -1
         // means unbounded (plain `text`/`citext`, or `varchar` with no
         // length given).
@@ -514,6 +536,7 @@ async fn list_columns(
                 };
                 TypeKind::Array {
                     elem_type,
+                    elem_type_schema: elem_type_schema.unwrap_or_else(|| "pg_catalog".to_string()),
                     elem_kind: Box::new(elem_kind),
                 }
             }
@@ -525,6 +548,7 @@ async fn list_columns(
             name,
             position,
             type_name,
+            type_schema,
             type_kind,
             max_length,
             vector_dimensions,

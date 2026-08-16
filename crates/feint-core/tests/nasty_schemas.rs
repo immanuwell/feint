@@ -36,6 +36,10 @@ use rstest::rstest;
 #[case::uuid_pk("uuid_pk", include_str!("fixtures/schemas/uuid_pk.sql"))]
 #[case::identity_serial("identity_serial", include_str!("fixtures/schemas/identity_serial.sql"))]
 #[case::partitioned("partitioned", include_str!("fixtures/schemas/partitioned.sql"))]
+#[case::enum_type_outside_search_path(
+    "enum_type_outside_search_path",
+    include_str!("fixtures/schemas/enum_type_outside_search_path.sql")
+)]
 #[tokio::test]
 async fn nasty_schema_generates_cleanly(#[case] name: &str, #[case] ddl: &str) {
     let mut db = TestDb::setup(name, ddl).await;
@@ -144,6 +148,7 @@ async fn enum_array_elements_are_introspected_and_generated_as_enum_values() {
         recent_moods.type_kind,
         TypeKind::Array {
             elem_type: "mood".to_string(),
+            elem_type_schema: db.schema_name.clone(),
             elem_kind: Box::new(TypeKind::Enum(vec![
                 "sad".to_string(),
                 "ok".to_string(),

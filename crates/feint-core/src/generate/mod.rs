@@ -308,6 +308,7 @@ fn dispatch_by_type(
         TypeKind::Array {
             elem_type,
             elem_kind,
+            ..
         } => {
             let len = rng.gen_range(1..=3usize);
             let mut items = Vec::with_capacity(len);
@@ -341,6 +342,7 @@ fn placeholder_column(type_name: &str, nullable: bool) -> Column {
         name: String::new(),
         position: 0,
         type_name: type_name.to_string(),
+        type_schema: "pg_catalog".to_string(),
         type_kind: TypeKind::Scalar,
         max_length: None,
         vector_dimensions: None,
@@ -658,6 +660,7 @@ mod tests {
             name: name.to_string(),
             position: 1,
             type_name: "text".to_string(),
+            type_schema: "pg_catalog".to_string(),
             type_kind: TypeKind::Scalar,
             max_length: None,
             vector_dimensions: None,

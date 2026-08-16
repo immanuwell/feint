@@ -232,6 +232,7 @@ mod tests {
             name: name.to_string(),
             position: 1,
             type_name: "text".to_string(),
+            type_schema: "pg_catalog".to_string(),
             type_kind: TypeKind::Scalar,
             max_length: None,
             vector_dimensions: None,
