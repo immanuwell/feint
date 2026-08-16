@@ -337,7 +337,21 @@ async fn list_columns(
         // `atttypmod` for varchar(N)/bpchar(N) is N + 4 (VARHDRSZ); -1
         // means unbounded (plain `text`/`citext`, or `varchar` with no
         // length given).
-        let max_length = if typmod > 0 && matches!(type_name.as_str(), "varchar" | "bpchar") {
+        // `atttypmod` on an array column describes the *element* type's
+        // modifier (Postgres applies the same encoding as the scalar case),
+        // so `text[]`... er, `varchar(N)[]`/`bpchar(N)[]` needs the element
+        // type name checked here too — not just the outer (`_varchar`-style)
+        // array type name, which never matches "varchar"/"bpchar" directly.
+        let is_length_bounded_type = |name: &str| matches!(name, "varchar" | "bpchar");
+        let is_array = type_category as u8 as char == 'A';
+        let max_length = if typmod > 0
+            && (is_length_bounded_type(&type_name)
+                || (is_array
+                    && elem_typname
+                        .as_deref()
+                        .map(is_length_bounded_type)
+                        .unwrap_or(false)))
+        {
             Some(typmod - 4)
         } else {
             None

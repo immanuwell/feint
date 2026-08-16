@@ -93,11 +93,26 @@ fn truncate_to_column_length(value: PgValue, column: &Column) -> PgValue {
     let Some(max_length) = column.max_length else {
         return value;
     };
-    let max_length = max_length.max(0) as usize;
+    truncate_text(value, max_length.max(0) as usize)
+}
+
+/// Applies to `PgValue::Text` directly and, recursively, to every element
+/// of a `PgValue::Array` — `column.max_length` for a `varchar(N)[]`/
+/// `bpchar(N)[]` column describes each *element*'s bound, not the array as
+/// a whole, so a plain top-level-only truncate would silently leave
+/// oversized array elements (e.g. Mattermost's `ids character
+/// varying(26)[]`, Funkwhale's `requested_data character varying(32)[]`).
+fn truncate_text(value: PgValue, max_length: usize) -> PgValue {
     match value {
         PgValue::Text(s) if s.chars().count() > max_length => {
             PgValue::Text(s.chars().take(max_length).collect())
         }
+        PgValue::Array(items) => PgValue::Array(
+            items
+                .into_iter()
+                .map(|v| truncate_text(v, max_length))
+                .collect(),
+        ),
         other => other,
     }
 }
