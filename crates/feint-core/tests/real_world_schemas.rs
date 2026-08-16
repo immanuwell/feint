@@ -13,10 +13,14 @@
 //! `vchord` available on top, which a couple of the fixtures need, and
 //! having those extra extensions present is harmless for the rest.
 //!
-//! Deliberately scoped to generate/clone/mask (the three modes every real
-//! database would actually go through). classify/profile/snapshot/subset
-//! are not exercised here — noting that rather than silently leaving it
-//! implied everything was covered.
+//! Covers generate/clone/mask (the three modes every real database would
+//! actually go through) plus classify, profile, and a snapshot/restore
+//! round trip. `subset` is deliberately still not exercised here — picking
+//! a generically meaningful `--root` table across 68 wildly different
+//! schemas isn't a safe, mechanical decision the harness can make on its
+//! own, unlike the other five commands, which need no schema-specific
+//! judgment calls to run. Noting that explicitly rather than silently
+//! leaving it implied everything was covered.
 //!
 //! Run with: `cargo test --test real_world_schemas -- --nocapture`
 
@@ -25,7 +29,7 @@ use std::collections::BTreeMap;
 use feint_core::config::FeintConfig;
 use feint_core::graph::plan_insertion;
 use feint_core::introspect::introspect;
-use feint_core::{clone, insert, sanitize};
+use feint_core::{classify, clone, insert, profile, sanitize, snapshot};
 use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
@@ -393,9 +397,12 @@ struct FixtureReport {
     apply_schema: Option<PhaseResult>,
     introspect: Option<PhaseResult>,
     plan: Option<PhaseResult>,
+    classify: Option<PhaseResult>,
     generate: Option<PhaseResult>,
+    profile: Option<PhaseResult>,
     clone: Option<PhaseResult>,
     mask: Option<PhaseResult>,
+    snapshot: Option<PhaseResult>,
 }
 
 async fn admin_client(host: &str, port: u16) -> Client {
@@ -589,20 +596,61 @@ async fn real_world_schemas_survive_feints_full_command_surface() {
         let table_names: Vec<String> = schema.tables.iter().map(|t| t.id.name.clone()).collect();
         let generate_config = config_with_rows(fixture.schema, &table_names, 3);
 
+        // `classify` is pure introspection — no live data needed, so it
+        // runs against the schema exactly as `feint classify` would
+        // before any table has a single row in it.
+        {
+            let classification = classify::classify_schema(&schema, &generate_config);
+            let sensitive_count = classification
+                .columns
+                .values()
+                .filter(|c| c.sensitive)
+                .count();
+            let detail = format!("{sensitive_count} sensitive column(s)");
+            println!("  ✓ classify: {detail}");
+            report.classify = Some(Ok(detail));
+        }
+
+        let mut source_populated = false;
         {
             let mut gen_client = db_client(&host, port, &source_db).await;
-            let txn = gen_client.transaction().await.expect("begin generate txn");
-            match insert::run(&txn, &schema, &plan, &generate_config, None, |_| {}).await {
-                Ok(summary) => {
-                    txn.commit().await.expect("commit generate");
-                    let detail = format!("{} rows generated", summary.total_rows);
-                    println!("  ✓ generate (up): {detail}");
-                    report.generate = Some(Ok(detail));
+            {
+                let txn = gen_client.transaction().await.expect("begin generate txn");
+                match insert::run(&txn, &schema, &plan, &generate_config, None, |_| {}).await {
+                    Ok(summary) => {
+                        txn.commit().await.expect("commit generate");
+                        let detail = format!("{} rows generated", summary.total_rows);
+                        println!("  ✓ generate (up): {detail}");
+                        report.generate = Some(Ok(detail));
+                        source_populated = true;
+                    }
+                    Err(e) => {
+                        txn.rollback().await.ok();
+                        let msg = format!("{e}");
+                        println!("  ✗ generate (up): {msg}");
+                        report.generate = Some(Err(msg));
+                    }
                 }
-                Err(e) => {
-                    let msg = format!("{e}");
-                    println!("  ✗ generate (up): {msg}");
-                    report.generate = Some(Err(msg));
+            }
+
+            // `profile` needs a populated database to capture row counts,
+            // null fractions, and cardinality histograms from — the
+            // source database `generate` just filled is exactly that,
+            // reusing the same connection rather than opening another.
+            if source_populated {
+                let profile_txn = gen_client.transaction().await.expect("begin profile txn");
+                match profile::capture(&profile_txn, &schema).await {
+                    Ok(_captured) => {
+                        profile_txn.rollback().await.ok();
+                        println!("  ✓ profile: captured");
+                        report.profile = Some(Ok("captured".to_string()));
+                    }
+                    Err(e) => {
+                        profile_txn.rollback().await.ok();
+                        let msg = format!("{e}");
+                        println!("  ✗ profile: {msg}");
+                        report.profile = Some(Err(msg));
+                    }
                 }
             }
         }
@@ -709,6 +757,107 @@ async fn real_world_schemas_survive_feints_full_command_surface() {
                             );
                             println!("  ✓ mask: {detail}");
                             report.mask = Some(Ok(detail));
+
+                            // Round-trip the masked target through a real
+                            // snapshot file into a brand-new, empty
+                            // database with the same schema applied —
+                            // proving the file format and restore path
+                            // work against a real, non-trivial schema
+                            // shape, not just curated fixtures.
+                            let snap_db = format!("real_world_{}_snap", fixture.name);
+                            admin
+                                .batch_execute(&format!("DROP DATABASE IF EXISTS \"{snap_db}\";"))
+                                .await
+                                .expect("drop old snapshot db");
+                            admin
+                                .batch_execute(&format!("CREATE DATABASE \"{snap_db}\";"))
+                                .await
+                                .expect("create snapshot db");
+                            let snap_client = db_client(&host, port, &snap_db).await;
+                            snap_client
+                                .batch_execute(fixture.sql)
+                                .await
+                                .expect("apply schema dump to snapshot target");
+
+                            let mut capture_client = db_client(&host, port, &target_db).await;
+                            let capture_txn = capture_client
+                                .build_transaction()
+                                .read_only(true)
+                                .start()
+                                .await
+                                .expect("begin snapshot capture txn");
+                            match snapshot::capture(
+                                &capture_txn,
+                                &target_schema,
+                                &empty_config,
+                                None,
+                            )
+                            .await
+                            {
+                                Ok(snap_file) => {
+                                    capture_txn.rollback().await.ok();
+                                    let restore_schema = match introspect(
+                                        &snap_client,
+                                        std::slice::from_ref(&fixture.schema.to_string()),
+                                    )
+                                    .await
+                                    {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            let msg = format!("re-introspect restore target: {e}");
+                                            println!("  ✗ snapshot: {msg}");
+                                            report.snapshot = Some(Err(msg));
+                                            reports.push((fixture.name, report));
+                                            continue;
+                                        }
+                                    };
+                                    let restore_plan = match plan_insertion(&restore_schema) {
+                                        Ok(p) => p,
+                                        Err(e) => {
+                                            let msg = format!("plan restore target: {e}");
+                                            println!("  ✗ snapshot: {msg}");
+                                            report.snapshot = Some(Err(msg));
+                                            reports.push((fixture.name, report));
+                                            continue;
+                                        }
+                                    };
+                                    let mut restore_client = db_client(&host, port, &snap_db).await;
+                                    let restore_txn = restore_client
+                                        .transaction()
+                                        .await
+                                        .expect("begin restore txn");
+                                    match snapshot::restore(
+                                        &restore_txn,
+                                        &restore_schema,
+                                        &restore_plan,
+                                        &snap_file,
+                                    )
+                                    .await
+                                    {
+                                        Ok(restore_summary) => {
+                                            restore_txn.commit().await.expect("commit restore");
+                                            let detail = format!(
+                                                "{} rows restored",
+                                                restore_summary.total_rows
+                                            );
+                                            println!("  ✓ snapshot: {detail}");
+                                            report.snapshot = Some(Ok(detail));
+                                        }
+                                        Err(e) => {
+                                            restore_txn.rollback().await.ok();
+                                            let msg = format!("restore: {e}");
+                                            println!("  ✗ snapshot: {msg}");
+                                            report.snapshot = Some(Err(msg));
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    capture_txn.rollback().await.ok();
+                                    let msg = format!("capture: {e}");
+                                    println!("  ✗ snapshot: {msg}");
+                                    report.snapshot = Some(Err(msg));
+                                }
+                            }
                         }
                         Err(e) => {
                             let msg = format!("{e}");
@@ -731,30 +880,42 @@ async fn real_world_schemas_survive_feints_full_command_surface() {
     println!("\n\nReal-world schema survey");
     println!("=========================");
     println!(
-        "{:<12} {:<12} {:<12} {:<10} {:<20} {:<20} {:<20}",
-        "fixture", "apply", "introspect", "plan", "generate", "clone", "mask"
+        "{:<12} {:<8} {:<10} {:<8} {:<16} {:<20} {:<16} {:<20} {:<20} {:<20}",
+        "fixture",
+        "apply",
+        "introspect",
+        "plan",
+        "classify",
+        "generate",
+        "profile",
+        "clone",
+        "mask",
+        "snapshot"
     );
     let mut any_failure = false;
     for (name, r) in &reports {
-        let mut cell = |p: &Option<PhaseResult>| -> String {
+        let mut cell = |p: &Option<PhaseResult>, width: usize| -> String {
             match p {
                 Some(Ok(_)) => "ok".to_string(),
                 Some(Err(e)) => {
                     any_failure = true;
-                    format!("FAIL: {}", &e[..e.len().min(60)])
+                    format!("FAIL: {}", &e[..e.len().min(width)])
                 }
                 None => "-".to_string(),
             }
         };
         println!(
-            "{:<12} {:<12} {:<12} {:<10} {:<20} {:<20} {:<20}",
+            "{:<12} {:<8} {:<10} {:<8} {:<16} {:<20} {:<16} {:<20} {:<20} {:<20}",
             name,
-            cell(&r.apply_schema),
-            cell(&r.introspect),
-            cell(&r.plan),
-            cell(&r.generate),
-            cell(&r.clone),
-            cell(&r.mask),
+            cell(&r.apply_schema, 20),
+            cell(&r.introspect, 20),
+            cell(&r.plan, 20),
+            cell(&r.classify, 30),
+            cell(&r.generate, 60),
+            cell(&r.profile, 30),
+            cell(&r.clone, 60),
+            cell(&r.mask, 60),
+            cell(&r.snapshot, 60),
         );
     }
 
@@ -762,7 +923,8 @@ async fn real_world_schemas_survive_feints_full_command_surface() {
         println!("\nAt least one fixture hit a real failure — see the table above and the per-phase log.");
     } else {
         println!(
-            "\nAll {} real-world schemas passed generate, clone, and mask cleanly.",
+            "\nAll {} real-world schemas passed generate, clone, mask, classify, profile, and \
+             snapshot/restore cleanly.",
             fixtures.len()
         );
     }
