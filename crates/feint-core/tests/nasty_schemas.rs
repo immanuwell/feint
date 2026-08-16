@@ -23,6 +23,10 @@ use rstest::rstest;
     "deferred_mixed_non_deferrable_order",
     include_str!("fixtures/schemas/deferred_mixed_non_deferrable_order.sql")
 )]
+#[case::deferred_hard_subcycle_nullable_escape(
+    "deferred_hard_subcycle_nullable_escape",
+    include_str!("fixtures/schemas/deferred_hard_subcycle_nullable_escape.sql")
+)]
 #[case::enums("enums", include_str!("fixtures/schemas/enums.sql"))]
 #[case::domains("domains", include_str!("fixtures/schemas/domains.sql"))]
 #[case::arrays("arrays", include_str!("fixtures/schemas/arrays.sql"))]

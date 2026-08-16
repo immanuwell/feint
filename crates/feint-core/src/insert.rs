@@ -1349,8 +1349,39 @@ pub(crate) async fn insert_backfill_group(
         results.push((table_id.qualified(), rows.len() as u64));
     }
 
-    // Backfill: for each cyclic FK, and each row of its owning table,
-    // sample a now-populated reference and UPDATE it in.
+    backfill_null_edges(
+        txn,
+        schema,
+        null_then_backfill,
+        config,
+        ref_pool,
+        &captured_pks,
+        &captured_returning,
+    )
+    .await?;
+
+    Ok(results)
+}
+
+/// UPDATEs each `r: FkRef`'s nulled column(s) back to a real sampled
+/// value, now that every table in the group has been written and
+/// registered in `ref_pool`. Shared by `insert_backfill_group` (a plain
+/// null-then-backfill cyclic group) and `insert_deferred_group` (a
+/// `Deferred` group whose non-deferrable edges needed the same
+/// null-then-backfill trick to break a hard sub-cycle among themselves —
+/// see `deferred_group_write_order`); both callers capture `captured_pks`/
+/// `captured_returning` identically while writing each table, so this is
+/// the one piece that's genuinely shared rather than coincidentally
+/// similar.
+async fn backfill_null_edges(
+    txn: &Transaction<'_>,
+    schema: &Schema,
+    null_then_backfill: &[FkRef],
+    config: &FeintConfig,
+    ref_pool: &RefPool,
+    captured_pks: &HashMap<TableId, Vec<Vec<PgValue>>>,
+    captured_returning: &HashMap<TableId, (Vec<String>, Vec<Vec<PgValue>>)>,
+) -> Result<()> {
     for r in null_then_backfill {
         let table = schema.table(&r.table).expect("table exists");
         let pk_cols = table.primary_key.clone().expect("checked above");
@@ -1484,43 +1515,31 @@ pub(crate) async fn insert_backfill_group(
             txn.execute(&sql, &params).await?;
         }
     }
-
-    Ok(results)
+    Ok(())
 }
 
-/// Orders `tables` so every internal FK edge that is *not* `DEFERRABLE`
-/// has its referenced table written before its referencing one —
-/// `SET CONSTRAINTS ALL DEFERRED` only defers checking for constraints
-/// actually declared `DEFERRABLE`; a group lands in `InsertGroup::Deferred`
-/// as soon as *any* internal edge is deferrable (see `plan_insertion`), so
-/// it can still contain edges Postgres checks immediately on `INSERT`
-/// regardless of that session-level setting. Twenty's real shape is
-/// exactly this: a 5-table cycle (`application`, `publicDomain`,
-/// `applicationRegistration`, `file`, `workspace`) where most edges are
-/// `DEFERRABLE INITIALLY DEFERRED` but `publicDomain.applicationId ->
-/// application(id)` is not — writing `publicDomain` before `application`
-/// had a real row on disk failed immediately with a foreign-key
-/// violation, not at commit. Self-loop edges (a table referencing itself)
-/// impose no ordering constraint relative to any *other* table, so
-/// they're skipped here the same way `plan_insertion` skips them for
-/// `Deferred` classification generally.
-fn deferred_group_write_order(schema: &Schema, tables: &[TableId]) -> Result<Vec<TableId>> {
-    let table_set: HashSet<&TableId> = tables.iter().collect();
+/// A valid write order for a `Deferred` group's actual `INSERT`s, plus any
+/// edges that couldn't be ordered directly and instead need the same
+/// null-then-backfill trick `InsertGroup::Backfill` uses. See
+/// `deferred_group_write_order`.
+struct DeferredWriteOrder {
+    tables: Vec<TableId>,
+    null_then_backfill: Vec<FkRef>,
+}
+
+/// Topologically sorts `tables` using only `edges` (parent = `fk.ref_table`
+/// must come before child = `r.table`) via Kahn's algorithm. `None` if
+/// `edges` don't form a DAG over `tables`.
+fn toposort_by_edges(tables: &[TableId], edges: &[FkRef]) -> Option<Vec<TableId>> {
     let mut children: HashMap<TableId, Vec<TableId>> =
         tables.iter().map(|t| (t.clone(), Vec::new())).collect();
     let mut in_degree: HashMap<TableId, usize> = tables.iter().map(|t| (t.clone(), 0)).collect();
-    for table_id in tables {
-        let table = schema.table(table_id).expect("table exists");
-        for fk in &table.foreign_keys {
-            if fk.deferrable || &fk.ref_table == table_id || !table_set.contains(&fk.ref_table) {
-                continue;
-            }
-            children
-                .get_mut(&fk.ref_table)
-                .expect("ref table is in this group")
-                .push(table_id.clone());
-            *in_degree.get_mut(table_id).expect("table is in this group") += 1;
-        }
+    for r in edges {
+        children
+            .get_mut(&r.fk.ref_table)
+            .expect("ref table is in this group")
+            .push(r.table.clone());
+        *in_degree.get_mut(&r.table).expect("table is in this group") += 1;
     }
 
     let mut queue: std::collections::VecDeque<TableId> = tables
@@ -1540,20 +1559,88 @@ fn deferred_group_write_order(schema: &Schema, tables: &[TableId]) -> Result<Vec
         order.push(t);
     }
 
-    if order.len() != tables.len() {
+    (order.len() == tables.len()).then_some(order)
+}
+
+/// Orders `tables` so every internal FK edge that is *not* `DEFERRABLE`
+/// has its referenced table written before its referencing one —
+/// `SET CONSTRAINTS ALL DEFERRED` only defers checking for constraints
+/// actually declared `DEFERRABLE`; a group lands in `InsertGroup::Deferred`
+/// as soon as *any* internal edge is deferrable (see `plan_insertion`), so
+/// it can still contain edges Postgres checks immediately on `INSERT`
+/// regardless of that session-level setting. Twenty's real shape is
+/// exactly this: a 5-table cycle (`application`, `publicDomain`,
+/// `applicationRegistration`, `file`, `workspace`) where most edges are
+/// `DEFERRABLE INITIALLY DEFERRED` but `publicDomain.applicationId ->
+/// application(id)` is not — writing `publicDomain` before `application`
+/// had a real row on disk failed immediately with a foreign-key
+/// violation, not at commit. Self-loop edges (a table referencing itself)
+/// impose no ordering constraint relative to any *other* table, so
+/// they're skipped here the same way `plan_insertion` skips them for
+/// `Deferred` classification generally.
+///
+/// If the non-deferrable edges alone don't form a DAG, this falls back to
+/// the same cycle-breaking trick `plan_insertion` already uses for a
+/// `Backfill` group: pull out whichever of those edges have a nullable
+/// local column (write them as `NULL` first, resolve them later via
+/// `backfill_null_edges`) and retry ordering with only the remaining
+/// (`NOT NULL`) non-deferrable edges. Only genuinely fails — a hard
+/// sub-cycle no nullable escape can break — when that second attempt
+/// still isn't a DAG.
+fn deferred_group_write_order(schema: &Schema, tables: &[TableId]) -> Result<DeferredWriteOrder> {
+    let table_set: HashSet<&TableId> = tables.iter().collect();
+    let mut non_deferrable: Vec<FkRef> = Vec::new();
+    for table_id in tables {
+        let table = schema.table(table_id).expect("table exists");
+        for fk in &table.foreign_keys {
+            if fk.deferrable || &fk.ref_table == table_id || !table_set.contains(&fk.ref_table) {
+                continue;
+            }
+            non_deferrable.push(FkRef {
+                table: table_id.clone(),
+                fk: fk.clone(),
+            });
+        }
+    }
+
+    if let Some(order) = toposort_by_edges(tables, &non_deferrable) {
+        return Ok(DeferredWriteOrder {
+            tables: order,
+            null_then_backfill: Vec::new(),
+        });
+    }
+
+    let is_edge_nullable = |r: &FkRef| {
+        let table = schema.table(&r.table).expect("table exists");
+        r.fk.columns
+            .iter()
+            .all(|col| table.column(col).map(|c| c.nullable).unwrap_or(false))
+    };
+    let (breakable, hard): (Vec<FkRef>, Vec<FkRef>) =
+        non_deferrable.into_iter().partition(is_edge_nullable);
+
+    let Some(order) = toposort_by_edges(tables, &hard) else {
         let names = tables
             .iter()
             .map(|t| t.qualified())
             .collect::<Vec<_>>()
             .join(", ");
+        let constraint_names = hard
+            .iter()
+            .map(|r| format!("{}.{}", r.table.qualified(), r.fk.name))
+            .collect::<Vec<_>>()
+            .join(", ");
         return Err(FeintError::Config(format!(
-            "tables [{names}] form a foreign-key cycle with no valid write order — the \
-             non-deferrable edges among them form a cycle on their own, which no insertion \
-             order can satisfy. Make at least one of the constraints in that inner cycle \
-             DEFERRABLE, or break it with a different, independently-resolvable edge."
+            "tables [{names}] form a foreign-key cycle with no valid write order, even after \
+             treating every nullable non-deferrable edge as null-then-backfill — the remaining \
+             NOT NULL edges ({constraint_names}) still form a cycle on their own. Make one of \
+             them DEFERRABLE or nullable, or break the cycle with a different edge."
         )));
-    }
-    Ok(order)
+    };
+    Ok(DeferredWriteOrder {
+        tables: order,
+        null_then_backfill: breakable,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1679,8 +1766,18 @@ pub(crate) async fn insert_deferred_group(
     // Postgres checks immediately regardless of `SET CONSTRAINTS ALL
     // DEFERRED`.
     let write_order = deferred_group_write_order(schema, tables)?;
+    let mut backfill_columns_by_table: HashMap<TableId, HashSet<String>> = HashMap::new();
+    for r in &write_order.null_then_backfill {
+        backfill_columns_by_table
+            .entry(r.table.clone())
+            .or_default()
+            .extend(r.fk.columns.iter().cloned());
+    }
+
     let mut results = Vec::new();
-    for table_id in &write_order {
+    let mut captured_pks: HashMap<TableId, Vec<Vec<PgValue>>> = HashMap::new();
+    let mut captured_returning: HashMap<TableId, (Vec<String>, Vec<Vec<PgValue>>)> = HashMap::new();
+    for table_id in &write_order.tables {
         let table = schema.table(table_id).expect("table exists");
         let planned_rows = rows_for(config, table_id, profile);
         progress(ProgressEvent::TableStarted {
@@ -1691,10 +1788,23 @@ pub(crate) async fn insert_deferred_group(
         let columns = supplied_columns(table);
         let mut rows = partial_rows.remove(table_id).unwrap_or_default();
         let skip = cyclic_columns.get(table_id).cloned().unwrap_or_default();
+        let backfill_cols = backfill_columns_by_table.get(table_id);
         let table_name = table_id.qualified();
 
         for fk in &table.foreign_keys {
             if !fk.columns.iter().any(|c| skip.contains(c)) {
+                continue;
+            }
+            if fk
+                .columns
+                .iter()
+                .any(|c| backfill_cols.is_some_and(|s| s.contains(c)))
+            {
+                // Left NULL by pass 1 (it's already in `skip`); resolved
+                // after every table in the group has been written, by
+                // `backfill_null_edges` below — this is the edge
+                // `deferred_group_write_order` couldn't fit into a pure
+                // write order and broke by nulling instead.
                 continue;
             }
             // Same collision-avoidance `insert_backfill_group` already
@@ -1825,10 +1935,40 @@ pub(crate) async fn insert_deferred_group(
             }
         }
 
-        let returning = returning_columns(table);
+        let pk_cols = table.primary_key.clone();
+        if pk_cols.is_none() && backfill_cols.is_some() {
+            return Err(FeintError::Config(format!(
+                "table `{}` is part of a foreign-key cycle resolved by null+backfill (within a \
+                 deferred group), but has no primary key to target the backfill UPDATE",
+                table_id.qualified()
+            )));
+        }
+
+        let mut returning = returning_columns(table);
+        if let Some(pk_cols) = &pk_cols {
+            for c in pk_cols {
+                if !returning.contains(c) {
+                    returning.push(c.clone());
+                }
+            }
+        }
+
         let returned =
             execute_batched_insert(txn, table, &columns, &rows, &returning, false).await?;
         register_returned(ref_pool, table, &returning, &returned);
+
+        if let Some(pk_cols) = &pk_cols {
+            let pk_indices: Vec<usize> = pk_cols
+                .iter()
+                .map(|c| returning.iter().position(|r| r == c).unwrap())
+                .collect();
+            let pks: Vec<Vec<PgValue>> = returned
+                .iter()
+                .map(|row| pk_indices.iter().map(|&i| row[i].clone()).collect())
+                .collect();
+            captured_pks.insert(table_id.clone(), pks);
+        }
+        captured_returning.insert(table_id.clone(), (returning, returned));
 
         progress(ProgressEvent::TableFinished {
             table: &table_id.qualified(),
@@ -1836,6 +1976,17 @@ pub(crate) async fn insert_deferred_group(
         });
         results.push((table_id.qualified(), rows.len() as u64));
     }
+
+    backfill_null_edges(
+        txn,
+        schema,
+        &write_order.null_then_backfill,
+        config,
+        ref_pool,
+        &captured_pks,
+        &captured_returning,
+    )
+    .await?;
 
     Ok(results)
 }
