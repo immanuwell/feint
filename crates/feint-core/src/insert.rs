@@ -1488,6 +1488,74 @@ pub(crate) async fn insert_backfill_group(
     Ok(results)
 }
 
+/// Orders `tables` so every internal FK edge that is *not* `DEFERRABLE`
+/// has its referenced table written before its referencing one —
+/// `SET CONSTRAINTS ALL DEFERRED` only defers checking for constraints
+/// actually declared `DEFERRABLE`; a group lands in `InsertGroup::Deferred`
+/// as soon as *any* internal edge is deferrable (see `plan_insertion`), so
+/// it can still contain edges Postgres checks immediately on `INSERT`
+/// regardless of that session-level setting. Twenty's real shape is
+/// exactly this: a 5-table cycle (`application`, `publicDomain`,
+/// `applicationRegistration`, `file`, `workspace`) where most edges are
+/// `DEFERRABLE INITIALLY DEFERRED` but `publicDomain.applicationId ->
+/// application(id)` is not — writing `publicDomain` before `application`
+/// had a real row on disk failed immediately with a foreign-key
+/// violation, not at commit. Self-loop edges (a table referencing itself)
+/// impose no ordering constraint relative to any *other* table, so
+/// they're skipped here the same way `plan_insertion` skips them for
+/// `Deferred` classification generally.
+fn deferred_group_write_order(schema: &Schema, tables: &[TableId]) -> Result<Vec<TableId>> {
+    let table_set: HashSet<&TableId> = tables.iter().collect();
+    let mut children: HashMap<TableId, Vec<TableId>> =
+        tables.iter().map(|t| (t.clone(), Vec::new())).collect();
+    let mut in_degree: HashMap<TableId, usize> = tables.iter().map(|t| (t.clone(), 0)).collect();
+    for table_id in tables {
+        let table = schema.table(table_id).expect("table exists");
+        for fk in &table.foreign_keys {
+            if fk.deferrable || &fk.ref_table == table_id || !table_set.contains(&fk.ref_table) {
+                continue;
+            }
+            children
+                .get_mut(&fk.ref_table)
+                .expect("ref table is in this group")
+                .push(table_id.clone());
+            *in_degree.get_mut(table_id).expect("table is in this group") += 1;
+        }
+    }
+
+    let mut queue: std::collections::VecDeque<TableId> = tables
+        .iter()
+        .filter(|t| in_degree[*t] == 0)
+        .cloned()
+        .collect();
+    let mut order = Vec::with_capacity(tables.len());
+    while let Some(t) = queue.pop_front() {
+        for child in &children[&t] {
+            let deg = in_degree.get_mut(child).expect("table is in this group");
+            *deg -= 1;
+            if *deg == 0 {
+                queue.push_back(child.clone());
+            }
+        }
+        order.push(t);
+    }
+
+    if order.len() != tables.len() {
+        let names = tables
+            .iter()
+            .map(|t| t.qualified())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(FeintError::Config(format!(
+            "tables [{names}] form a foreign-key cycle with no valid write order — the \
+             non-deferrable edges among them form a cycle on their own, which no insertion \
+             order can satisfy. Make at least one of the constraints in that inner cycle \
+             DEFERRABLE, or break it with a different, independently-resolvable edge."
+        )));
+    }
+    Ok(order)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn insert_deferred_group(
     txn: &Transaction<'_>,
@@ -1604,9 +1672,15 @@ pub(crate) async fn insert_deferred_group(
     }
 
     // Pass 2: resolve the cyclic columns now that every table's
-    // non-cyclic (usually PK) values are registered.
+    // non-cyclic (usually PK) values are registered, then actually write
+    // each table — in an order that respects any non-deferrable internal
+    // edge (see `deferred_group_write_order`); a group only needs *one*
+    // deferrable edge to land here, so it can still contain edges
+    // Postgres checks immediately regardless of `SET CONSTRAINTS ALL
+    // DEFERRED`.
+    let write_order = deferred_group_write_order(schema, tables)?;
     let mut results = Vec::new();
-    for table_id in tables {
+    for table_id in &write_order {
         let table = schema.table(table_id).expect("table exists");
         let planned_rows = rows_for(config, table_id, profile);
         progress(ProgressEvent::TableStarted {

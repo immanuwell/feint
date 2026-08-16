@@ -19,6 +19,10 @@ use rstest::rstest;
 )]
 #[case::cycle_nullable("cycle_nullable", include_str!("fixtures/schemas/cycle_nullable.sql"))]
 #[case::cycle_deferred("cycle_deferred", include_str!("fixtures/schemas/cycle_deferred.sql"))]
+#[case::deferred_mixed_non_deferrable_order(
+    "deferred_mixed_non_deferrable_order",
+    include_str!("fixtures/schemas/deferred_mixed_non_deferrable_order.sql")
+)]
 #[case::enums("enums", include_str!("fixtures/schemas/enums.sql"))]
 #[case::domains("domains", include_str!("fixtures/schemas/domains.sql"))]
 #[case::arrays("arrays", include_str!("fixtures/schemas/arrays.sql"))]
@@ -80,6 +84,41 @@ async fn hard_unsatisfiable_cycle_is_rejected_at_planning_time() {
     assert!(
         result.is_err(),
         "expected a NOT NULL, non-deferrable FK cycle to be rejected before any insert is attempted"
+    );
+}
+
+/// Twenty's real shape: a cyclic group lands in `InsertGroup::Deferred`
+/// because *some* internal edge is deferrable, but two of the group's
+/// other edges are NOT DEFERRABLE and form a hard cycle between
+/// themselves — `SET CONSTRAINTS ALL DEFERRED` can't defer a constraint
+/// that was never declared DEFERRABLE, so no write order can satisfy
+/// both non-deferrable edges at once. `plan_insertion` itself succeeds
+/// (routing to `Deferred`, since it only checks "any edge deferrable"),
+/// but `up`/`generate` must still reject this with a clear error rather
+/// than a raw, uninformative FK-violation from Postgres partway through
+/// a batch.
+#[tokio::test]
+async fn deferred_group_with_a_hard_non_deferrable_subcycle_is_rejected_at_generate_time() {
+    let mut db = TestDb::setup(
+        "deferred_hard_subcycle",
+        include_str!("fixtures/schemas/deferred_hard_subcycle_unsatisfiable.sql"),
+    )
+    .await;
+    let schema = db.introspect().await;
+    let plan = plan_insertion(&schema).expect("plan_insertion should succeed (routes to Deferred)");
+    let config = feint_core::config::FeintConfig::from_schema(&schema);
+    let txn = db.client.transaction().await.expect("begin txn");
+    let result = feint_core::insert::run(&txn, &schema, &plan, &config, None, |_| {}).await;
+    let Err(err) = result else {
+        panic!(
+            "expected the hard non-deferrable sub-cycle between `a` and `b` to be rejected with a \
+             clear error rather than a raw Postgres FK-violation"
+        );
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("no valid write order"),
+        "expected a clear write-order error, got: {msg}"
     );
 }
 
