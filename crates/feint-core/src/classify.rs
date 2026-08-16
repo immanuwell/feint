@@ -240,6 +240,7 @@ mod tests {
             check_min: None,
             check_max: None,
             check_allowed_values: None,
+            check_null_escape: false,
             nullable: true,
             identity: Identity::None,
             is_stored_generated: false,

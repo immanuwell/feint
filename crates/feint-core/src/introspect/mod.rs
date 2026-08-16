@@ -94,6 +94,20 @@ pub struct Column {
     /// function call, etc). Multiple matching constraints on the same
     /// column are intersected, same as `check_min`/`check_max`.
     pub check_allowed_values: Option<Vec<String>>,
+    /// True when some CHECK constraint on this table has, at its top
+    /// level, a `col IS NULL` alternative of an `OR` — e.g. Twenty's
+    /// `CHECK (("privateKey" IS NULL) OR (("privateKey")::text LIKE
+    /// 'enc:v2:%'))`, or a cross-column ordering escape like Sentry's
+    /// `CHECK ((scheduled_cancel_at_step > step) OR
+    /// (scheduled_cancel_at_step IS NULL))`. Making that one alternative
+    /// true (i.e. generating `NULL`) always makes the whole `OR` true
+    /// regardless of what the *other* alternative says, however complex
+    /// it is — so this is always a safe, correct value to prefer without
+    /// ever needing to parse the rest of the expression. Only ever `true`
+    /// when `nullable` is also `true` (a NOT NULL column could never
+    /// satisfy `col IS NULL` in the first place, so the escape wouldn't
+    /// be reachable).
+    pub check_null_escape: bool,
     pub nullable: bool,
     pub identity: Identity,
     /// `GENERATED ALWAYS AS (...) STORED` — never written by feint.
@@ -253,6 +267,7 @@ pub async fn introspect(client: &Client, schemas: &[String]) -> Result<Schema> {
             .map(|u| u.columns.clone());
         let foreign_keys = list_foreign_keys(client, rt.oid).await?;
         let check_constraints = list_check_constraints(client, rt.oid).await?;
+        let null_escapes = null_escape_columns(&check_constraints);
 
         for col in &mut columns {
             if matches!(col.type_name.as_str(), "int2" | "int4" | "int8") {
@@ -261,6 +276,7 @@ pub async fn introspect(client: &Client, schemas: &[String]) -> Result<Schema> {
                 col.check_max = max;
             }
             col.check_allowed_values = simple_allowed_values(&check_constraints, &col.name);
+            col.check_null_escape = col.nullable && null_escapes.contains(&col.name);
         }
 
         tables.push(Table {
@@ -466,6 +482,7 @@ async fn list_columns(
             check_min: None,
             check_max: None,
             check_allowed_values: None,
+            check_null_escape: false,
             nullable: !not_null,
             identity,
             is_stored_generated,
@@ -734,6 +751,116 @@ fn simple_allowed_values(
     allowed.filter(|v| !v.is_empty())
 }
 
+/// Matches a single top-level `OR` alternative that's exactly a bare
+/// `col IS NULL` test (after [`strip_matching_outer_parens`] has already
+/// removed its wrapping parens) — nothing else, so it's safe to treat
+/// generating `NULL` for `col` as sufficient to satisfy the whole `OR`
+/// regardless of what any other alternative says.
+static NULL_ESCAPE_ALT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r#"^"?([A-Za-z_][A-Za-z0-9_]*)"?\s+IS NULL$"#).expect("valid regex")
+});
+
+/// Splits `expr` on every top-level (paren-depth-zero) ` OR ` — the
+/// boolean structure of a `pg_get_constraintdef` expression is fully
+/// parenthesized, so this is enough to separate a multi-way `OR`'s
+/// alternatives without needing a real expression parser, as long as
+/// nested `OR`s (inside a sub-expression one level down, e.g. Twenty's
+/// `connectionParameters` check) stay untouched — which they do, since
+/// they're never at depth zero relative to `expr`'s own start.
+///
+/// Byte-indexed rather than `char`-indexed: every position this function
+/// ever slices `expr` at is immediately after a run of single-byte ASCII
+/// characters (`(`, `)`, or the 4-byte literal `" OR "`), which is always
+/// a valid UTF-8 char boundary regardless of what non-ASCII bytes appear
+/// elsewhere in the string (e.g. inside a quoted literal) — ASCII bytes
+/// can never be mistaken for a multi-byte sequence's continuation byte.
+fn split_top_level_or(expr: &str) -> Vec<&str> {
+    let bytes = expr.as_bytes();
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+            }
+            b' ' if depth == 0 && bytes[i..].starts_with(b" OR ") => {
+                parts.push(&expr[start..i]);
+                i += 4;
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    parts.push(&expr[start..]);
+    parts
+}
+
+/// Strips one or more layers of outer parens from `s`, but only when the
+/// first `(` and last `)` are a genuinely matching pair — i.e. paren
+/// depth returns to zero only at the very last character, not partway
+/// through (which would mean the first/last chars belong to two different
+/// sub-expressions, e.g. `(a) OR (b)`, not a redundant wrap around the
+/// whole thing).
+fn strip_matching_outer_parens(s: &str) -> &str {
+    let mut s = s.trim();
+    loop {
+        let bytes = s.as_bytes();
+        if bytes.first() != Some(&b'(') || bytes.last() != Some(&b')') {
+            return s;
+        }
+        let mut depth = 0i32;
+        let mut closes_at_end = true;
+        for (idx, &b) in bytes.iter().enumerate() {
+            match b {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 && idx != bytes.len() - 1 {
+                        closes_at_end = false;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !closes_at_end {
+            return s;
+        }
+        s = s[1..s.len() - 1].trim();
+    }
+}
+
+/// Every column name on this table that some CHECK constraint's top-level
+/// `OR` would be trivially satisfied by leaving `NULL` — see
+/// `Column::check_null_escape`'s doc comment for the reasoning. Doesn't
+/// attempt to understand any other alternative of the `OR`, however
+/// complex; only the alternative that turns out to be a bare `col IS
+/// NULL` needs to be that simple.
+fn null_escape_columns(check_constraints: &[CheckConstraint]) -> std::collections::HashSet<String> {
+    let mut escapes = std::collections::HashSet::new();
+    for c in check_constraints {
+        let def = c.definition.trim();
+        let Some(rest) = def.strip_prefix("CHECK ") else {
+            continue;
+        };
+        let inner = strip_matching_outer_parens(rest);
+        for alt in split_top_level_or(inner) {
+            let alt = strip_matching_outer_parens(alt);
+            if let Some(caps) = NULL_ESCAPE_ALT_RE.captures(alt) {
+                escapes.insert(caps[1].to_string());
+            }
+        }
+    }
+    escapes
+}
+
 async fn list_check_constraints(client: &Client, table_oid: u32) -> Result<Vec<CheckConstraint>> {
     let rows = client
         .query(
@@ -909,5 +1036,90 @@ mod tests {
     #[test]
     fn no_matching_constraint_returns_none() {
         assert_eq!(simple_allowed_values(&[], "role"), None);
+    }
+
+    #[test]
+    fn null_escape_with_like_pattern_on_the_other_side_is_found() {
+        // Twenty's real shape.
+        let constraints = vec![check(
+            "CHK_signingKey_privateKey_encrypted",
+            "CHECK (((\"privateKey\" IS NULL) OR ((\"privateKey\")::text ~~ 'enc:v2:%'::text)))",
+        )];
+        let escapes = null_escape_columns(&constraints);
+        assert!(escapes.contains("privateKey"));
+        assert_eq!(escapes.len(), 1);
+    }
+
+    #[test]
+    fn null_escape_on_the_right_side_of_a_compound_left_side_is_found() {
+        // n8n's real shape: the left alternative is a compound AND, the
+        // escape is the simple right alternative.
+        let constraints = vec![check(
+            "instance_ai_checkpoints_state_tombstone_check",
+            "CHECK (((\"expiredAt\" IS NOT NULL) AND (state IS NULL)) OR (\"expiredAt\" IS NULL))",
+        )];
+        let escapes = null_escape_columns(&constraints);
+        assert_eq!(escapes, ["expiredAt".to_string()].into_iter().collect());
+    }
+
+    #[test]
+    fn null_escape_with_cross_column_comparison_on_the_other_side_is_found() {
+        // Sentry's real shape.
+        let constraints = vec![check(
+            "scheduled_cancel_at_step_greater_than_current_step",
+            "CHECK ((scheduled_cancel_at_step > step) OR (scheduled_cancel_at_step IS NULL))",
+        )];
+        let escapes = null_escape_columns(&constraints);
+        assert!(escapes.contains("scheduled_cancel_at_step"));
+    }
+
+    #[test]
+    fn both_sides_being_null_escapes_finds_both() {
+        let constraints = vec![check(
+            "workspace_or_registration",
+            "CHECK ((\"workspaceId\" IS NULL) OR (\"applicationRegistrationId\" IS NULL))",
+        )];
+        let escapes = null_escape_columns(&constraints);
+        assert!(escapes.contains("workspaceId"));
+        assert!(escapes.contains("applicationRegistrationId"));
+        assert_eq!(escapes.len(), 2);
+    }
+
+    #[test]
+    fn three_way_or_finds_the_null_alternative() {
+        let constraints = vec![check(
+            "valid_range",
+            "CHECK ((valid_from IS NULL) OR (valid_until IS NULL) OR (valid_from < valid_until))",
+        )];
+        let escapes = null_escape_columns(&constraints);
+        assert!(escapes.contains("valid_from"));
+        assert!(escapes.contains("valid_until"));
+    }
+
+    #[test]
+    fn nested_or_inside_an_and_is_not_a_top_level_escape() {
+        // A deeper nested OR (inside an AND, inside the "other" branch of
+        // the outer OR) must never be mistaken for a top-level escape —
+        // only the outermost alternatives count.
+        let constraints = vec![check(
+            "connection_parameters_encrypted",
+            "CHECK ((\"connectionParameters\" IS NULL) OR (((password_imap IS NULL) OR \
+             (password_imap ~~ 'enc:v2:%'::text)) AND ((password_smtp IS NULL) OR \
+             (password_smtp ~~ 'enc:v2:%'::text))))",
+        )];
+        let escapes = null_escape_columns(&constraints);
+        // Only the genuinely top-level escape is found; the nested ones
+        // inside the AND are not, since forcing password_imap NULL alone
+        // wouldn't satisfy the AND (password_smtp still needs to hold).
+        assert_eq!(
+            escapes,
+            ["connectionParameters".to_string()].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn no_null_alternative_returns_empty() {
+        let constraints = vec![check("simple", "CHECK ((price >= (0)::numeric))")];
+        assert!(null_escape_columns(&constraints).is_empty());
     }
 }

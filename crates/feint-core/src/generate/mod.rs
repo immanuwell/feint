@@ -47,6 +47,14 @@ pub fn generate_value(
     override_generator: Option<&str>,
     rng: &mut ChaCha8Rng,
 ) -> Result<PgValue> {
+    // A CHECK constraint's top-level `col IS NULL` escape (see
+    // `Column::check_null_escape`) is trivially and always satisfiable by
+    // generating NULL, regardless of what the constraint's other
+    // alternative says — cheaper and more certain than trying to satisfy
+    // that other alternative, so it's checked first.
+    if override_generator.is_none() && column.check_null_escape {
+        return Ok(PgValue::Null);
+    }
     // A `col = ANY (ARRAY[...])`/singleton `col = 'x'` CHECK constraint is a
     // hard database constraint, not a nicety like the name heuristic below
     // — picking from it takes priority over every other unconfigured path,
@@ -341,6 +349,7 @@ fn placeholder_column(type_name: &str, nullable: bool) -> Column {
         check_min: None,
         check_max: None,
         check_allowed_values: None,
+        check_null_escape: false,
         nullable,
         identity: crate::introspect::Identity::None,
         is_stored_generated: false,
@@ -657,6 +666,7 @@ mod tests {
             check_min: None,
             check_max: None,
             check_allowed_values: None,
+            check_null_escape: false,
             nullable: false,
             identity: Identity::None,
             is_stored_generated: false,
@@ -803,6 +813,43 @@ mod tests {
             PgValue::Text(s) => assert_ne!(s, "USER"),
             other => panic!("expected Text, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn check_null_escape_always_generates_null() {
+        let col = Column {
+            check_null_escape: true,
+            nullable: true,
+            ..text_column("privateKey")
+        };
+        let mut rng = derive_rng(
+            "seed",
+            &SeedKey {
+                table: "signingKey",
+                column: "privateKey",
+                row_identity: "0",
+            },
+        );
+        assert_eq!(generate_value(&col, None, &mut rng).unwrap(), PgValue::Null);
+    }
+
+    #[test]
+    fn explicit_override_generator_bypasses_check_null_escape() {
+        let col = Column {
+            check_null_escape: true,
+            nullable: true,
+            ..text_column("privateKey")
+        };
+        let mut rng = derive_rng(
+            "seed",
+            &SeedKey {
+                table: "signingKey",
+                column: "privateKey",
+                row_identity: "0",
+            },
+        );
+        let v = generate_value(&col, Some("first_name"), &mut rng).unwrap();
+        assert_ne!(v, PgValue::Null);
     }
 
     #[test]
