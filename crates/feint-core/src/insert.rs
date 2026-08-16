@@ -16,7 +16,7 @@ use crate::config::FeintConfig;
 use crate::error::{FeintError, Result};
 use crate::generate::{derive_rng, generate_value, SeedKey};
 use crate::graph::{FkRef, InsertGroup, InsertPlan};
-use crate::introspect::{Column, Schema, Table, TableId};
+use crate::introspect::{Column, ForeignKey, Identity, Schema, Table, TableId};
 use crate::value::PgValue;
 
 const MAX_BIND_PARAMS: usize = 65_000;
@@ -263,6 +263,29 @@ pub async fn run(
                     total_rows += c;
                     rows_by_table.push((t, c));
                 }
+            }
+            InsertGroup::SelfReferencing(table_id) => {
+                let table = schema.table(table_id).expect("table exists in schema");
+                progress(ProgressEvent::TableStarted {
+                    table: &table_id.qualified(),
+                    planned_rows: rows_for(config, table_id, profile),
+                });
+                let n = insert_self_referencing_table(
+                    txn,
+                    table,
+                    rows_for(config, table_id, profile),
+                    config,
+                    profile,
+                    &mut ref_pool,
+                    referenced_tables.contains(table_id),
+                )
+                .await?;
+                progress(ProgressEvent::TableFinished {
+                    table: &table_id.qualified(),
+                    rows: n,
+                });
+                rows_by_table.push((table_id.qualified(), n));
+                total_rows += n;
             }
         }
     }
@@ -919,6 +942,215 @@ async fn insert_plain_table_with_cardinality(
         register_returned(ref_pool, table, &returning, &returned);
     } else {
         crate::copy::copy_rows(txn, table, &columns, &rows).await?;
+    }
+    Ok(rows.len() as u64)
+}
+
+/// The Postgres sequence backing `column`, if any — resolves both a plain
+/// `nextval()` serial default and a `GENERATED ALWAYS/BY DEFAULT AS
+/// IDENTITY` column. `pub(crate)`: shared with `clone::resync_sequences`,
+/// which needs the identical lookup.
+///
+/// `pg_get_serial_sequence`'s `table_name` argument is parsed with
+/// ordinary SQL identifier rules, not treated as a literal relation name:
+/// an unquoted mixed-case part (e.g. Documenso's `"User"` table) silently
+/// case-folds to `user` and the lookup misses. Quoting each part here
+/// preserves the case exactly like it would in a normal qualified
+/// reference.
+pub(crate) async fn serial_sequence_name(
+    txn: &Transaction<'_>,
+    table: &Table,
+    column_name: &str,
+) -> Result<Option<String>> {
+    let qualified = format!("\"{}\".\"{}\"", table.id.schema, table.id.name);
+    let seq_row = txn
+        .query_one(
+            "SELECT pg_get_serial_sequence($1, $2)",
+            &[&qualified, &column_name],
+        )
+        .await?;
+    Ok(seq_row.get(0))
+}
+
+/// Reserves `n` consecutive values from `seq_name` via `nextval()`, in
+/// order, as the exact PK values a self-referencing table's rows will use
+/// — see `insert_self_referencing_table`.
+async fn prefetch_sequence_values(
+    txn: &Transaction<'_>,
+    seq_name: &str,
+    n: i64,
+    column: &Column,
+) -> Result<Vec<PgValue>> {
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    // `nextval`'s argument is `regclass`; tokio-postgres's `ToSql` only
+    // binds text-family types to a placeholder, so — same as
+    // `clone::resync_sequences` — inline it as a literal. `seq_name` comes
+    // straight from `pg_get_serial_sequence`, never user input.
+    let literal = seq_name.replace('\'', "''");
+    let rows = txn
+        .query(
+            &format!("SELECT nextval('{literal}') FROM generate_series(1, $1::bigint)"),
+            &[&n],
+        )
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            let v: i64 = row.get(0);
+            match column.type_name.as_str() {
+                "int2" => PgValue::Int2(v as i16),
+                "int8" => PgValue::Int8(v),
+                _ => PgValue::Int4(v as i32),
+            }
+        })
+        .collect())
+}
+
+/// A table whose only cyclic dependency is a self-referencing FK on a
+/// sequence-backed server-assigned column (almost always its own PK) —
+/// `InsertGroup::SelfReferencing`. feint never otherwise knows a row's
+/// own serial/identity value until *after* insert (via `RETURNING`), by
+/// which point any self-reference on that same row would already have
+/// had to be written — so a self-reference can never get a real value
+/// through the normal generate-then-insert flow, regardless of
+/// nullability or deferrability. Real hand-written seed scripts solve
+/// this the same way: reserve primary keys from the sequence up front and
+/// write them explicitly. This does that — pre-fetches `planned_rows`
+/// values via `nextval()`, writes them into each row's own PK column
+/// explicitly (bypassing `DEFAULT`, using `OVERRIDING SYSTEM VALUE` for a
+/// `GENERATED ALWAYS AS IDENTITY` column), and resolves every
+/// self-referencing column by sampling among the ids already decided for
+/// rows `0..=i` (including the row's own) — always valid, since Postgres
+/// only checks a non-deferrable FK once the whole triggering `INSERT`
+/// statement's rows already exist, and any earlier row is already
+/// committed within this transaction by the time a later chunk's
+/// `INSERT` runs.
+pub(crate) async fn insert_self_referencing_table(
+    txn: &Transaction<'_>,
+    table: &Table,
+    planned_rows: u32,
+    config: &FeintConfig,
+    profile: Option<&crate::profile::ProfileFile>,
+    ref_pool: &mut RefPool,
+    is_referenced: bool,
+) -> Result<u64> {
+    let empty = std::collections::BTreeMap::new();
+    let overrides = config
+        .table_config(&table.id.qualified())
+        .map(|t| &t.columns)
+        .unwrap_or(&empty);
+
+    let self_fks: Vec<&ForeignKey> = table
+        .foreign_keys
+        .iter()
+        .filter(|fk| fk.ref_table == table.id)
+        .collect();
+    let self_fk_columns: HashSet<String> = self_fks
+        .iter()
+        .flat_map(|fk| fk.columns.iter().cloned())
+        .collect();
+
+    let mut prefetch_col_names: Vec<String> = Vec::new();
+    for fk in &self_fks {
+        for c in &fk.ref_columns {
+            if !prefetch_col_names.contains(c) {
+                prefetch_col_names.push(c.clone());
+            }
+        }
+    }
+
+    let mut prefetched: HashMap<String, Vec<PgValue>> = HashMap::new();
+    let mut needs_overriding = false;
+    for col_name in &prefetch_col_names {
+        let col = table
+            .column(col_name)
+            .expect("ref column exists on its own table");
+        if matches!(col.identity, Identity::Always) {
+            needs_overriding = true;
+        }
+        let seq_name = serial_sequence_name(txn, table, col_name)
+            .await?
+            .ok_or_else(|| {
+                FeintError::Config(format!(
+                "table `{}` has a self-referencing foreign key on `{}`, but no backing Postgres \
+                 sequence could be found for it — this shouldn't be possible for a plain serial \
+                 default or identity column.",
+                table.id.qualified(),
+                col_name
+            ))
+            })?;
+        let values = prefetch_sequence_values(txn, &seq_name, planned_rows as i64, col).await?;
+        prefetched.insert(col_name.clone(), values);
+    }
+
+    let mut columns = supplied_columns(table);
+    for col in &table.columns {
+        if prefetched.contains_key(&col.name) {
+            columns.push(col);
+        }
+    }
+    columns.sort_by_key(|c| c.position);
+
+    let key_sets = unique_key_index_sets_excluding(table, &columns, &self_fk_columns);
+    let mut seen: Vec<Vec<Vec<PgValue>>> = vec![Vec::new(); key_sets.len()];
+
+    let table_name = table.id.qualified();
+    let mut rows: Vec<Vec<PgValue>> = Vec::with_capacity(planned_rows as usize);
+    for i in 0..planned_rows {
+        let mut row = generate_unique_row(
+            table,
+            &columns,
+            i as u64,
+            &config.seed,
+            overrides,
+            &self_fk_columns,
+            ref_pool,
+            profile,
+            &key_sets,
+            &mut seen,
+        )?;
+
+        for (col_name, values) in &prefetched {
+            let pos = columns
+                .iter()
+                .position(|c| &c.name == col_name)
+                .expect("prefetched column was added to the supplied list above");
+            row[pos] = values[i as usize].clone();
+        }
+
+        for fk in &self_fks {
+            let mut rng = derive_rng(
+                &config.seed,
+                &SeedKey {
+                    table: &table_name,
+                    column: &fk.name,
+                    row_identity: &i.to_string(),
+                },
+            );
+            let pick = rng.gen_range(0..=i as usize);
+            for (local_col, ref_col) in fk.columns.iter().zip(&fk.ref_columns) {
+                let pos = columns
+                    .iter()
+                    .position(|c| &c.name == local_col)
+                    .expect("self-fk column was added to the supplied list above");
+                row[pos] = prefetched[ref_col][pick].clone();
+            }
+        }
+
+        rows.push(row);
+    }
+
+    if is_referenced {
+        let returning = returning_columns(table);
+        let returned =
+            execute_batched_insert(txn, table, &columns, &rows, &returning, needs_overriding)
+                .await?;
+        register_returned(ref_pool, table, &returning, &returned);
+    } else {
+        crate::copy::bulk_insert_no_returning(txn, table, &columns, &rows, needs_overriding)
+            .await?;
     }
     Ok(rows.len() as u64)
 }

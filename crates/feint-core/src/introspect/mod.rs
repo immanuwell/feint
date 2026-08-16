@@ -105,6 +105,17 @@ impl Column {
             || matches!(self.identity, Identity::Always)
             || self.is_serial_default
     }
+
+    /// True for a server-assigned column that's actually backed by a real
+    /// Postgres sequence (`nextval()`-default or `GENERATED ALWAYS AS
+    /// IDENTITY`), as opposed to `is_stored_generated`, which is computed
+    /// by an expression and has no sequence to reserve values from. A
+    /// self-referencing FK on this kind of column can be resolved by
+    /// pre-reserving its values via `nextval()` before generating any
+    /// row; a stored-generated one can't.
+    pub fn is_sequence_backed(&self) -> bool {
+        self.is_serial_default || matches!(self.identity, Identity::Always)
+    }
 }
 
 /// Build the SELECT expression used to read a column into `PgValue`.

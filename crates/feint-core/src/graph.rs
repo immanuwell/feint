@@ -64,6 +64,16 @@ pub enum InsertGroup {
         tables: Vec<TableId>,
         null_then_backfill: Vec<FkRef>,
     },
+    /// A single table whose only cyclic dependency is on itself, through a
+    /// column that's server-assigned but backed by a real sequence (a
+    /// plain serial default or `GENERATED ALWAYS AS IDENTITY`) — e.g.
+    /// Zammad's `users.created_by_id`/`updated_by_id` (NOT NULL,
+    /// non-deferrable) or BookWyrm's `bookwyrm_status.reply_parent_id`
+    /// (nullable, deferrable), both self-referencing their own serial
+    /// `id`. Resolved by reserving `id` values from the sequence up front
+    /// via `nextval()` and writing them explicitly, the same way a
+    /// hand-written seed script would — see `insert_self_referencing_table`.
+    SelfReferencing(TableId),
 }
 
 impl InsertGroup {
@@ -72,6 +82,7 @@ impl InsertGroup {
             InsertGroup::Simple(t) => std::slice::from_ref(t),
             InsertGroup::Deferred(ts) => ts,
             InsertGroup::Backfill { tables, .. } => tables,
+            InsertGroup::SelfReferencing(t) => std::slice::from_ref(t),
         }
     }
 }
@@ -137,6 +148,27 @@ pub fn plan_insertion(schema: &Schema) -> Result<InsertPlan> {
                     });
                 }
             }
+        }
+
+        // A pure self-loop where every self-referencing column targets a
+        // sequence-backed server-assigned column (almost always its own
+        // PK) has a resolution strategy none of the branches below know
+        // about — reserving `id` values from the sequence before
+        // generating any row — so it's routed there regardless of
+        // deferrability or nullability, ahead of every other check.
+        if has_self_loop
+            && !internal.is_empty()
+            && internal.iter().all(|r| {
+                let ref_table = schema.table(&r.fk.ref_table).expect("table exists");
+                r.fk.ref_columns.iter().all(|c| {
+                    ref_table
+                        .column(c)
+                        .is_some_and(|col| col.is_sequence_backed())
+                })
+            })
+        {
+            groups.push(InsertGroup::SelfReferencing(tables[0].clone()));
+            continue;
         }
 
         if internal.iter().any(|r| r.fk.deferrable) {

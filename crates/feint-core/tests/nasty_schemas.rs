@@ -9,6 +9,10 @@ use rstest::rstest;
 #[rstest]
 #[case::composite_fk("composite_fk", include_str!("fixtures/schemas/composite_fk.sql"))]
 #[case::self_ref_fk("self_ref_fk", include_str!("fixtures/schemas/self_ref_fk.sql"))]
+#[case::self_ref_fk_not_null(
+    "self_ref_fk_not_null",
+    include_str!("fixtures/schemas/self_ref_fk_not_null.sql")
+)]
 #[case::cycle_nullable("cycle_nullable", include_str!("fixtures/schemas/cycle_nullable.sql"))]
 #[case::cycle_deferred("cycle_deferred", include_str!("fixtures/schemas/cycle_deferred.sql"))]
 #[case::enums("enums", include_str!("fixtures/schemas/enums.sql"))]

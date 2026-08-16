@@ -33,6 +33,7 @@ pub async fn run(database_url: &str, config_path: &Path, schemas: &[String]) -> 
                     InsertGroup::Simple(_) => None,
                     InsertGroup::Deferred(_) => Some("deferred cycle"),
                     InsertGroup::Backfill { .. } => Some("null+backfill cycle"),
+                    InsertGroup::SelfReferencing(_) => Some("self-referencing, sequence-anchored"),
                 };
                 for table in group.tables() {
                     let rows = config

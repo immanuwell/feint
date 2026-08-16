@@ -239,7 +239,7 @@ pub async fn restore(
 
     for group in &plan.groups {
         match group {
-            InsertGroup::Simple(table_id) => {
+            InsertGroup::Simple(table_id) | InsertGroup::SelfReferencing(table_id) => {
                 let table = target_schema.table(table_id).expect("table exists");
                 let n = restore_table(target_txn, table, &by_table).await?;
                 rows_by_table.push((table_id.qualified(), n));

@@ -191,7 +191,7 @@ fn validate_hybrid_config(schema: &Schema, config: &FeintConfig, plan: &InsertPl
         let tables: &[TableId] = match group {
             InsertGroup::Deferred(t) => t,
             InsertGroup::Backfill { tables, .. } => tables,
-            InsertGroup::Simple(_) => continue,
+            InsertGroup::Simple(_) | InsertGroup::SelfReferencing(_) => continue,
         };
         if tables.len() < 2 {
             continue;
@@ -269,21 +269,9 @@ pub(crate) async fn resync_sequences(
         let Some(max_value) = rows.iter().filter_map(|r| pgvalue_as_i64(&r[idx])).max() else {
             continue;
         };
-        // `pg_get_serial_sequence`'s `table_name` argument is parsed with
-        // ordinary SQL identifier rules, not treated as a literal relation
-        // name: an unquoted mixed-case part (e.g. Documenso's `"User"`
-        // table) silently case-folds to `user` and the lookup misses.
-        // Quoting each part here preserves the case exactly like it would
-        // in a normal qualified reference.
-        let qualified = format!("\"{}\".\"{}\"", table.id.schema, table.id.name);
-        let seq_row = target_txn
-            .query_one(
-                "SELECT pg_get_serial_sequence($1, $2)",
-                &[&qualified, &col.name],
-            )
-            .await?;
-        let seq_name: Option<String> = seq_row.get(0);
-        if let Some(seq_name) = seq_name {
+        if let Some(seq_name) =
+            crate::insert::serial_sequence_name(target_txn, table, &col.name).await?
+        {
             // `setval`'s first parameter is `regclass`, and tokio-postgres
             // refuses to bind a `String` to a regclass-typed placeholder
             // (its `ToSql` impl only accepts text-family OIDs). `seq_name`
@@ -426,6 +414,43 @@ pub async fn run(
                         total_rows += n;
                     }
                 }
+            }
+            InsertGroup::SelfReferencing(table_id) => {
+                let table = schema.table(table_id).expect("table exists in schema");
+                progress(ProgressEvent::TableStarted {
+                    table: &table_id.qualified(),
+                });
+                let n = match table_strategy(config, table_id) {
+                    TableStrategy::Mask => {
+                        clone_table_full(
+                            source_txn,
+                            target_txn,
+                            table,
+                            config,
+                            subset,
+                            &mut ref_pool,
+                        )
+                        .await?
+                    }
+                    TableStrategy::Generate => {
+                        insert::insert_self_referencing_table(
+                            target_txn,
+                            table,
+                            insert::rows_for(config, table_id, None),
+                            config,
+                            None,
+                            &mut ref_pool,
+                            referenced_tables.contains(table_id),
+                        )
+                        .await?
+                    }
+                };
+                progress(ProgressEvent::TableFinished {
+                    table: &table_id.qualified(),
+                    rows: n,
+                });
+                rows_by_table.push((table_id.qualified(), n));
+                total_rows += n;
             }
             InsertGroup::Backfill {
                 tables,
