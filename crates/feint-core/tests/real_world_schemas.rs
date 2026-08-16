@@ -9,9 +9,9 @@
 //! shared container, since every dump hardcodes `public.<table>` — a
 //! database is the cheapest way to get an isolated `public` schema without
 //! rewriting a single line of any dump. One `ghcr.io/immich-app/postgres`
-//! image is used for all twenty: it's a real Postgres 16 with `vector` and
-//! `vchord` available on top, which two of the original ten fixtures need,
-//! and having those extra extensions present is harmless for the rest.
+//! image is used for all of them: it's a real Postgres 16 with `vector` and
+//! `vchord` available on top, which a couple of the fixtures need, and
+//! having those extra extensions present is harmless for the rest.
 //!
 //! Deliberately scoped to generate/clone/mask (the three modes every real
 //! database would actually go through). classify/profile/snapshot/subset
@@ -34,8 +34,8 @@ use tokio_postgres::{Client, NoTls};
 struct Fixture {
     name: &'static str,
     sql: &'static str,
-    /// Schema to introspect, if not "public" (only `twenty` uses a
-    /// non-default schema, "core").
+    /// Schema to introspect, if not "public". `twenty` uses "core";
+    /// `zulip` uses "zulip". Every other fixture uses "public".
     schema: &'static str,
 }
 
@@ -138,6 +138,101 @@ const FIXTURES: &[Fixture] = &[
     Fixture {
         name: "outline",
         sql: include_str!("fixtures/real_world_schemas/outline.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "odoo",
+        sql: include_str!("fixtures/real_world_schemas/odoo.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "n8n",
+        sql: include_str!("fixtures/real_world_schemas/n8n.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "umami",
+        sql: include_str!("fixtures/real_world_schemas/umami.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "formbricks",
+        sql: include_str!("fixtures/real_world_schemas/formbricks.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "grafana",
+        sql: include_str!("fixtures/real_world_schemas/grafana.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "linkwarden",
+        sql: include_str!("fixtures/real_world_schemas/linkwarden.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "paperless_ngx",
+        sql: include_str!("fixtures/real_world_schemas/paperless_ngx.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "vikunja",
+        sql: include_str!("fixtures/real_world_schemas/vikunja.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "superset",
+        sql: include_str!("fixtures/real_world_schemas/superset.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "authentik",
+        sql: include_str!("fixtures/real_world_schemas/authentik.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "windmill",
+        sql: include_str!("fixtures/real_world_schemas/windmill.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "strapi",
+        sql: include_str!("fixtures/real_world_schemas/strapi.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "redash",
+        sql: include_str!("fixtures/real_world_schemas/redash.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "mealie",
+        sql: include_str!("fixtures/real_world_schemas/mealie.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "mattermost",
+        sql: include_str!("fixtures/real_world_schemas/mattermost.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "funkwhale",
+        sql: include_str!("fixtures/real_world_schemas/funkwhale.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "nextcloud",
+        sql: include_str!("fixtures/real_world_schemas/nextcloud.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "peertube",
+        sql: include_str!("fixtures/real_world_schemas/peertube.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "zammad",
+        sql: include_str!("fixtures/real_world_schemas/zammad.sql"),
         schema: "public",
     },
 ];
