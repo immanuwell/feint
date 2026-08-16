@@ -289,7 +289,60 @@ pub async fn introspect(client: &Client, schemas: &[String]) -> Result<Schema> {
         });
     }
 
+    narrow_referenced_column_lengths(&mut tables);
+
     Ok(Schema { tables })
+}
+
+/// A column's own declared `max_length` isn't always the tightest legal
+/// bound on what feint may generate into it: if another table's FK
+/// references it through a *narrower* `varchar`/`bpchar` column (or an
+/// unbounded `text` column referenced by *any* bounded one), every value
+/// this column generates must also fit that narrower bound, or the
+/// referencing row could never legally point at it. n8n's
+/// `credentials_entity.id varchar(36)`, referenced by
+/// `dynamic_credential_entry.credential_id varchar(16)`, is a real
+/// instance: a generated `id` longer than 16 characters can be a
+/// perfectly valid `credentials_entity` row and still make every FK
+/// sampling it fail with a length violation, because the *referencing*
+/// value (copied straight from the sample, bypassing
+/// `generate_value`/`truncate_to_column_length` entirely — truncating
+/// there instead would silently break referential integrity, producing a
+/// value that matches no real row) was never given the chance to fit.
+/// Runs once, as a schema-wide post-pass after every table's own columns
+/// and FKs are loaded, since narrowing a column requires knowing about
+/// every *other* table's FKs that reference it — not visible from that
+/// table's own introspection.
+fn narrow_referenced_column_lengths(tables: &mut [Table]) {
+    let mut tightest: HashMap<(TableId, String), i32> = HashMap::new();
+    for table in tables.iter() {
+        for fk in &table.foreign_keys {
+            for (local_name, ref_name) in fk.columns.iter().zip(&fk.ref_columns) {
+                let Some(local_len) = table.column(local_name).and_then(|c| c.max_length) else {
+                    continue;
+                };
+                let key = (fk.ref_table.clone(), ref_name.clone());
+                tightest
+                    .entry(key)
+                    .and_modify(|len| *len = (*len).min(local_len))
+                    .or_insert(local_len);
+            }
+        }
+    }
+    for table in tables.iter_mut() {
+        for col in &mut table.columns {
+            let Some(&tight) = tightest.get(&(table.id.clone(), col.name.clone())) else {
+                continue;
+            };
+            let narrower = match col.max_length {
+                Some(own) => tight < own,
+                None => true,
+            };
+            if narrower {
+                col.max_length = Some(tight);
+            }
+        }
+    }
 }
 
 /// Ordinary and partitioned tables, excluding partition children
