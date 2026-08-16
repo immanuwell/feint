@@ -567,6 +567,41 @@ fn unique_key_index_sets_excluding(
         .collect()
 }
 
+/// Describes one colliding UNIQUE key set for `generate_unique_row`'s
+/// exhaustion error — distinguishing a genuine foreign key (where the
+/// fix is almost always "give the referenced table more rows") from a
+/// column whose own declared type or a CHECK constraint caps how many
+/// distinct values it can ever hold (Metabase's `UNIQUE (is_active
+/// boolean)`, capped at 2 non-null values; Rallly's singleton
+/// `instance_settings`, capped at 1 row by its own `CHECK (id = 1)`),
+/// where "increase the referenced table's rows" is nonsensical advice
+/// since there's no referenced table at all.
+fn describe_unique_collision(table: &Table, columns: &[&Column], key: &[usize]) -> String {
+    let col_names: Vec<&str> = key.iter().map(|&i| columns[i].name.as_str()).collect();
+    let is_fk_column = |name: &str| {
+        table
+            .foreign_keys
+            .iter()
+            .any(|fk| fk.columns.iter().any(|c| c == name))
+    };
+    if !col_names.is_empty() && col_names.iter().all(|c| is_fk_column(c)) {
+        format!(
+            "`{}` (a foreign key) — the referenced table likely doesn't have enough distinct \
+             rows to fill it uniquely (increase its `rows:` in feint.yaml)",
+            col_names.join(", ")
+        )
+    } else {
+        format!(
+            "`{}` — its own declared type or a CHECK constraint caps how many distinct values \
+             it can ever hold (e.g. a `boolean` column tops out at 2 non-null values; a \
+             singleton-table CHECK caps the whole table at 1 row), so no `rows:` increase can \
+             satisfy it — lower this table's own `rows:` instead, or add an explicit \
+             `generator:` override for the column",
+            col_names.join(", ")
+        )
+    }
+}
+
 /// Generate one row, retrying with a different derived seed if it collides
 /// with an already-generated row of the same batch on any of `table`'s
 /// UNIQUE constraints. Plain per-row-independent `RefPool` sampling has no
@@ -589,6 +624,12 @@ fn generate_unique_row(
     key_sets: &[Vec<usize>],
     seen: &mut [Vec<Vec<PgValue>>],
 ) -> Result<Vec<PgValue>> {
+    // Which key sets collided on the *last* attempt — kept around so a
+    // final failure can name the actual constraint(s) responsible instead
+    // of a generic message, since this function's UNIQUE constraints
+    // aren't always an FK (a plain `UNIQUE (some_boolean)` or a
+    // CHECK-capped singleton table hits this same retry loop).
+    let mut last_collisions: Vec<bool> = vec![false; key_sets.len()];
     for attempt in 0..=MAX_UNIQUE_RETRY_ATTEMPTS {
         let row_identity = if attempt == 0 {
             row_index.to_string()
@@ -617,11 +658,12 @@ fn generate_unique_row(
                 }
             })
             .collect();
-        let collides = tuples
+        let per_key_collides: Vec<bool> = tuples
             .iter()
             .zip(seen.iter())
-            .any(|(tuple, seen_rows)| matches!(tuple, Some(t) if seen_rows.contains(t)));
-        if !collides {
+            .map(|(tuple, seen_rows)| matches!(tuple, Some(t) if seen_rows.contains(t)))
+            .collect();
+        if !per_key_collides.iter().any(|&c| c) {
             for (tuple, seen_rows) in tuples.into_iter().zip(seen.iter_mut()) {
                 if let Some(t) = tuple {
                     seen_rows.push(t);
@@ -629,12 +671,21 @@ fn generate_unique_row(
             }
             return Ok(row);
         }
+        last_collisions = per_key_collides;
     }
+    let colliding_sets: Vec<&Vec<usize>> = key_sets
+        .iter()
+        .zip(last_collisions.iter())
+        .filter_map(|(key, &collided)| collided.then_some(key))
+        .collect();
+    let detail = colliding_sets
+        .iter()
+        .map(|key| describe_unique_collision(table, columns, key))
+        .collect::<Vec<_>>()
+        .join("; ");
     Err(FeintError::Config(format!(
         "table `{}` couldn't generate row {} without violating one of its own UNIQUE \
-         constraints after {MAX_UNIQUE_RETRY_ATTEMPTS} attempts — the referenced table(s) \
-         likely don't have enough distinct rows to fill it uniquely (increase their `rows:` \
-         in feint.yaml)",
+         constraints after {MAX_UNIQUE_RETRY_ATTEMPTS} attempts — {detail}",
         table.id.qualified(),
         row_index + 1,
     )))

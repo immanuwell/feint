@@ -152,6 +152,63 @@ async fn simple_group_reports_a_clear_error_when_the_pool_is_too_small() {
         msg.contains("UNIQUE"),
         "error message should mention UNIQUE constraints: {msg}"
     );
+    assert!(
+        msg.contains("foreign key") && msg.contains("referenced table"),
+        "a UNIQUE constraint made entirely of FK columns should get the \
+         referenced-table-needs-more-rows advice: {msg}"
+    );
+}
+
+/// Metabase's real shape: `UNIQUE (is_active)` on a plain `boolean`
+/// column — no foreign key at all, so the exhaustion error's old
+/// "the referenced table(s) likely don't have enough distinct rows"
+/// advice was actively misleading (there is no referenced table; the
+/// column's own type caps it at 2 non-null distinct values).
+#[tokio::test]
+async fn non_fk_unique_column_reports_its_own_cardinality_cap_not_a_referenced_table() {
+    use feint_core::config::FeintConfig;
+    use feint_core::error::FeintError;
+    use feint_core::graph::plan_insertion;
+
+    let mut db = TestDb::setup(
+        "unique_boolean_exhausted",
+        "CREATE TABLE source_replacement_run (
+            id serial primary key,
+            is_active boolean not null unique
+        );",
+    )
+    .await;
+    let schema = db.introspect().await;
+
+    let mut config = FeintConfig::from_schema(&schema);
+    config
+        .tables
+        .get_mut(&format!("{}.source_replacement_run", db.schema_name))
+        .expect("table in config")
+        .rows = 3; // only 2 distinct boolean values possible
+
+    let plan = plan_insertion(&schema).expect("insertion plan");
+    let txn = db.client.transaction().await.expect("begin txn");
+    let err = match feint_core::insert::run(&txn, &schema, &plan, &config, None, |_| {}).await {
+        Ok(_) => panic!("expected a clear config error, not a raw crash"),
+        Err(e) => e,
+    };
+    txn.rollback().await.ok();
+    assert!(
+        matches!(err, FeintError::Config(_)),
+        "expected FeintError::Config, got {err:?}"
+    );
+    let msg = err.to_string();
+    assert!(
+        !msg.contains("referenced table"),
+        "a non-FK UNIQUE column must not get referenced-table advice, which is \
+         nonsensical when there is no referenced table: {msg}"
+    );
+    assert!(
+        msg.contains("is_active") && msg.contains("own declared type"),
+        "expected the message to name the column and explain its own cardinality \
+         cap: {msg}"
+    );
 }
 
 /// Backfill-group table (Listmonk's `roles` shape): a nullable
