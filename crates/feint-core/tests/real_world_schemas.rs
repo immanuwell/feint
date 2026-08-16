@@ -285,6 +285,51 @@ const FIXTURES: &[Fixture] = &[
         sql: include_str!("fixtures/real_world_schemas/plane.sql"),
         schema: "public",
     },
+    Fixture {
+        name: "freshrss",
+        sql: include_str!("fixtures/real_world_schemas/freshrss.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "joplin",
+        sql: include_str!("fixtures/real_world_schemas/joplin.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "bookwyrm",
+        sql: include_str!("fixtures/real_world_schemas/bookwyrm.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "kanboard",
+        sql: include_str!("fixtures/real_world_schemas/kanboard.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "kutt",
+        sql: include_str!("fixtures/real_world_schemas/kutt.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "cachet",
+        sql: include_str!("fixtures/real_world_schemas/cachet.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "passbolt",
+        sql: include_str!("fixtures/real_world_schemas/passbolt.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "healthchecks",
+        sql: include_str!("fixtures/real_world_schemas/healthchecks.sql"),
+        schema: "public",
+    },
+    Fixture {
+        name: "automatisch",
+        sql: include_str!("fixtures/real_world_schemas/automatisch.sql"),
+        schema: "public",
+    },
 ];
 
 /// Per-fixture, per-phase outcome. `Ok(detail)` for a human-readable
